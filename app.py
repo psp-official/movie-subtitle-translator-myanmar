@@ -1,9 +1,9 @@
-
 import os
 import re
 import json
 import tempfile
 import subprocess
+import shutil
 from pathlib import Path
 from io import BytesIO
 
@@ -23,7 +23,7 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
 def make_timestamp(seconds):
     """Convert seconds into SRT timestamp format."""
-    milliseconds = int(round(max(0, seconds) * 1000))
+    milliseconds = int(round(max(0, float(seconds)) * 1000))
 
     hours, remainder = divmod(milliseconds, 3600000)
     minutes, remainder = divmod(remainder, 60000)
@@ -39,20 +39,34 @@ def make_timestamp(seconds):
 
 def clean_json_response(text):
     """Remove Markdown code fences from AI responses."""
-    text = text.strip()
+    text = str(text).strip()
+
     text = re.sub(
         r"^```(?:json)?\s*|\s*```$",
         "",
         text,
         flags=re.IGNORECASE
     )
+
     return text.strip()
 
 
+def get_field(obj, field, default=None):
+    """Read a field from either a dictionary or an object."""
+    if isinstance(obj, dict):
+        return obj.get(field, default)
+
+    return getattr(obj, field, default)
+
+
 def translate_batch(model, segments):
-    """Translate a group of Chinese dialogue lines into Burmese."""
+    """Translate Chinese dialogue into natural conversational Burmese."""
+
     payload = [
-        {"id": i, "text": segment["text"]}
+        {
+            "id": i,
+            "text": segment["text"]
+        }
         for i, segment in enumerate(segments)
     ]
 
@@ -68,6 +82,7 @@ Rules:
 - Keep every ID and preserve the original order.
 - Return ONLY a valid JSON array.
 - Each item must contain "id" and "myanmar".
+- Translate every line.
 - If a line is unclear, translate conservatively.
 
 Input:
@@ -75,13 +90,32 @@ Input:
 """
 
     response = model.generate_content(prompt)
-    result = json.loads(clean_json_response(response.text))
 
-    translations = {
-        int(item["id"]): str(item["myanmar"]).strip()
-        for item in result
-        if "id" in item and "myanmar" in item
-    }
+    response_text = get_field(response, "text", "")
+
+    if not response_text:
+        raise ValueError("Gemini returned an empty response.")
+
+    result = json.loads(clean_json_response(response_text))
+
+    if not isinstance(result, list):
+        raise ValueError("Gemini response is not a JSON array.")
+
+    translations = {}
+
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+
+        if "id" not in item or "myanmar" not in item:
+            continue
+
+        try:
+            translations[int(item["id"])] = str(
+                item["myanmar"]
+            ).strip()
+        except (TypeError, ValueError):
+            continue
 
     return [
         translations.get(i, segment["text"])
@@ -96,13 +130,19 @@ def home():
 
 @app.post("/api/process")
 def process_video():
+
+    # Check uploaded file
     if "video" not in request.files:
-        return jsonify(error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"), 400
+        return jsonify(
+            error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"
+        ), 400
 
     video = request.files["video"]
 
     if not video.filename:
-        return jsonify(error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"), 400
+        return jsonify(
+            error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"
+        ), 400
 
     filename = secure_filename(video.filename)
     extension = Path(filename).suffix.lower()
@@ -112,33 +152,42 @@ def process_video():
             error="MP4, MOV, MKV သို့မဟုတ် WEBM ဖိုင်ကို ရွေးပါ။"
         ), 400
 
+    # Check API keys
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not groq_key or not gemini_key:
         return jsonify(
             error=(
-                "Server Environment Variables ထဲမှာ "
-                "GROQ_API_KEY နဲ့ GEMINI_API_KEY ထည့်ပေးပါ။"
+                "Render Environment Variables ထဲမှာ "
+                "GROQ_API_KEY နဲ့ GEMINI_API_KEY "
+                "နှစ်ခုလုံး ထည့်ထားကြောင်း စစ်ပါ။"
             )
         ), 500
 
+    # Import API libraries
     try:
         from groq import Groq
         import google.generativeai as genai
+
     except ImportError:
+        app.logger.exception("Required library import failed")
+
         return jsonify(
             error="လိုအပ်သော Python libraries များ မတပ်ဆင်ရသေးပါ။"
         ), 500
 
+    # Create temporary working directory
     job_dir = Path(tempfile.mkdtemp(dir=UPLOAD_DIR))
+
     video_path = job_dir / filename
     audio_path = job_dir / "audio.mp3"
 
     try:
         video.save(video_path)
 
-        # Extract audio without modifying the original video.
+        # Extract audio using FFmpeg.
+        # The original video is not modified or re-rendered.
         command = [
             "ffmpeg",
             "-y",
@@ -158,11 +207,21 @@ def process_video():
         )
 
         if result.returncode != 0 or not audio_path.exists():
+            app.logger.error(
+                "FFmpeg audio extraction failed: %s",
+                result.stderr[-3000:]
+            )
+
             return jsonify(
                 error="ဗီဒီယိုထဲက အသံကို ထုတ်ယူလို့မရပါ။"
             ), 400
 
-        # Speech-to-text using Groq Whisper.
+        if audio_path.stat().st_size == 0:
+            return jsonify(
+                error="ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။"
+            ), 400
+
+        # Speech-to-text using Groq Whisper
         groq_client = Groq(api_key=groq_key)
 
         with open(audio_path, "rb") as audio_file:
@@ -176,61 +235,107 @@ def process_video():
 
         raw_segments = []
 
-        for segment in (transcription.segments or []):
-            text = str(segment.text).strip()
-            start = float(segment.start)
-            end = float(segment.end)
+        # Support both dictionaries and objects returned by the API.
+        transcription_segments = get_field(
+            transcription,
+            "segments",
+            []
+        ) or []
 
-            if text:
-                raw_segments.append({
-                    "start": start,
-                    "end": max(start + 0.15, end),
-                    "text": text
-                })
+        for segment in transcription_segments:
+            try:
+                text = str(
+                    get_field(segment, "text", "") or ""
+                ).strip()
+
+                start = float(
+                    get_field(segment, "start", 0) or 0
+                )
+
+                end = float(
+                    get_field(segment, "end", start) or start
+                )
+
+            except (TypeError, ValueError):
+                app.logger.warning(
+                    "Skipping invalid transcription segment: %r",
+                    segment
+                )
+                continue
+
+            if not text:
+                continue
+
+            start = max(0.0, start)
+            end = max(start + 0.15, end)
+
+            raw_segments.append({
+                "start": start,
+                "end": end,
+                "text": text
+            })
 
         if not raw_segments:
             return jsonify(
                 error=(
-                    "စကားပြောကို မတွေ့ပါ။ "
+                    "စကားပြောစာသား မတွေ့ပါ။ "
                     "အသံပါသော တရုတ်ဗီဒီယိုနဲ့ ပြန်စမ်းပါ။"
                 )
             ), 422
 
-        # Translate dialogue into Burmese using Gemini.
+        # Configure Gemini for Burmese translation
         genai.configure(api_key=gemini_key)
+
         model = genai.GenerativeModel("gemini-2.5-flash")
 
         translated_lines = []
 
+        # Translate in batches to avoid oversized requests
         batch_size = 25
 
-        for start_index in range(0, len(raw_segments), batch_size):
+        for start_index in range(
+            0,
+            len(raw_segments),
+            batch_size
+        ):
             batch = raw_segments[
                 start_index:start_index + batch_size
             ]
 
             try:
                 translations = translate_batch(model, batch)
+
             except Exception:
-                # Keep original text for failed batches so the
-                # user can still review and edit those lines.
+                app.logger.exception(
+                    "Gemini translation batch failed at index %s",
+                    start_index
+                )
+
+                # Keep the original Chinese text for failed batches.
+                # The user can review or edit these lines.
                 translations = [
                     item["text"] for item in batch
                 ]
 
             translated_lines.extend(translations)
 
-        # Build subtitle editor data.
+        # Build subtitle editor data
         items = []
 
         for index, segment in enumerate(raw_segments):
+            translated_text = (
+                translated_lines[index]
+                if index < len(translated_lines)
+                else segment["text"]
+            )
+
             items.append({
                 "index": index + 1,
                 "time": (
                     f"{make_timestamp(segment['start'])} --> "
                     f"{make_timestamp(segment['end'])}"
                 ),
-                "text": translated_lines[index],
+                "text": translated_text,
                 "source": segment["text"]
             })
 
@@ -245,32 +350,37 @@ def process_video():
         )
 
     except subprocess.TimeoutExpired:
+        app.logger.exception("FFmpeg processing timed out")
+
         return jsonify(
             error="ဗီဒီယိုအသံထုတ်ယူချိန် ကျော်လွန်သွားပါတယ်။"
         ), 504
 
     except Exception:
         app.logger.exception("Video processing failed")
+
         return jsonify(
             error=(
                 "လုပ်ဆောင်မှု မအောင်မြင်ပါ။ "
-                "API Key၊ API quota နဲ့ Server Logs ကို စစ်ပါ။"
+                "Render Logs၊ API Key နဲ့ API quota ကို စစ်ပါ။"
             )
         ), 500
 
     finally:
-        # Clean up temporary files after processing.
-        import shutil
+        # Delete temporary video/audio files after processing
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @app.post("/api/export")
 def export_srt():
+
     data = request.get_json(silent=True) or {}
     items = data.get("items", [])
 
     if not isinstance(items, list):
-        return jsonify(error="Subtitle data မမှန်ပါ။"), 400
+        return jsonify(
+            error="Subtitle data မမှန်ပါ။"
+        ), 400
 
     output = []
 
@@ -284,14 +394,17 @@ def export_srt():
         if "-->" not in timestamp or not text:
             continue
 
-        # Prevent invalid multiline SRT structure.
+        # Prevent malformed SRT blocks
         output.append(
-            f"{len(output) + 1}\n{timestamp}\n{text}"
+            f"{len(output) + 1}\n"
+            f"{timestamp}\n"
+            f"{text}"
         )
 
-    srt_content = "\n\n".join(output) + (
-        "\n" if output else ""
-    )
+    srt_content = "\n\n".join(output)
+
+    if srt_content:
+        srt_content += "\n"
 
     return send_file(
         BytesIO(srt_content.encode("utf-8-sig")),
