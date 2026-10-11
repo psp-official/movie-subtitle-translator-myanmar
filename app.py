@@ -4,6 +4,8 @@ import json
 import tempfile
 import subprocess
 import shutil
+import time
+from collections import OrderedDict
 from pathlib import Path
 from io import BytesIO
 
@@ -23,6 +25,13 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 # Change this model ID only if Google AI Studio shows a different
 # supported model ID for your API key.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Tune these in Render Environment Variables without changing the code.
+GEMINI_BATCH_SIZE = max(1, min(40, int(os.getenv("GEMINI_BATCH_SIZE", "25"))))
+GEMINI_RETRIES = max(0, min(5, int(os.getenv("GEMINI_RETRIES", "3"))))
+TRANSLATION_CACHE_MAX = 5000
+# In-memory cache: avoids repeat Gemini calls within the same running worker.
+# It clears when the service restarts and is not shared between workers.
+TRANSLATION_CACHE = OrderedDict()
 
 
 def get_field(obj, name, default=None):
@@ -106,91 +115,114 @@ def clean_json_response(text):
     return text.strip()
 
 
+def _cache_get(text):
+    key = re.sub(r"\s+", " ", str(text or "")).strip()
+    value = TRANSLATION_CACHE.get(key)
+    if value is not None:
+        TRANSLATION_CACHE.move_to_end(key)
+    return key, value
+
+
+def _cache_put(key, value):
+    TRANSLATION_CACHE[key] = value
+    TRANSLATION_CACHE.move_to_end(key)
+    while len(TRANSLATION_CACHE) > TRANSLATION_CACHE_MAX:
+        TRANSLATION_CACHE.popitem(last=False)
+
+
 def translate_batch(model, segments):
-    """Translate Chinese dialogue into natural spoken Burmese."""
-    payload = [
-        {"id": i, "text": segment["text"]}
-        for i, segment in enumerate(segments)
-    ]
+    """Translate only uncached Chinese dialogue into natural spoken Burmese."""
+    translations = {}
+    uncached = []
+    cache_keys = {}
 
-    prompt = f"""
-Translate each Chinese movie dialogue line into natural,
-conversational Burmese (Myanmar language).
+    for idx, segment in enumerate(segments):
+        key, cached = _cache_get(segment["text"])
+        cache_keys[idx] = key
+        if cached is not None:
+            translations[idx] = cached
+        else:
+            uncached.append({"id": idx, "text": segment["text"]})
 
-IMPORTANT RULES:
-- The output language MUST be Burmese.
-- Do NOT return Chinese as the translation.
-- Preserve meaning, emotion, and character intent.
-- Do not summarize or add narration.
-- Keep the exact IDs and original order.
-- Translate every item.
-- Return ONLY a valid JSON array.
-- Every item must contain "id" and "myanmar".
-- If a line is unclear, provide the most conservative Burmese translation.
+    if uncached:
+        prompt = f"""
+You are a professional Chinese-to-Myanmar subtitle translator for Chinese movies.
+Translate each Chinese dialogue line into natural, fluent, conversational Burmese
+(Myanmar language) that sounds like real people speaking, not a literal machine translation.
 
-Example format:
-[
-  {{"id": 0, "myanmar": "မြန်မာဘာသာပြန်စာသား"}}
-]
+RULES:
+- Output Burmese only for each translation; do not leave the Chinese untranslated.
+- Preserve the exact meaning, character intent, emotion, relationship, and tone.
+- Use natural spoken Burmese appropriate to the scene; avoid stiff, bookish wording.
+- Keep each subtitle concise enough to read on screen, but never omit important meaning.
+- Do not summarize, explain, add narration, or invent details.
+- Keep IDs exactly as supplied and return every item in the same order.
+- If the Chinese is ambiguous, choose the most contextually safe translation.
+- Return ONLY a valid JSON array with each object containing integer "id" and string "myanmar".
+
+Example:
+[{{"id": 0, "myanmar": "မင်း ဘာလုပ်နေတာလဲ။"}}]
 
 Input:
-{json.dumps(payload, ensure_ascii=False)}
+{json.dumps(uncached, ensure_ascii=False)}
 """
 
-    response = model.generate_content(prompt)
-    response_text = get_field(response, "text", "")
+        response = None
+        for attempt in range(GEMINI_RETRIES + 1):
+            try:
+                response = model.generate_content(prompt)
+                break
+            except Exception as exc:
+                message = str(exc).lower()
+                is_rate_limit = any(token in message for token in (
+                    "429", "rate limit", "quota", "resource_exhausted",
+                    "too many requests"
+                ))
+                if not is_rate_limit or attempt >= GEMINI_RETRIES:
+                    raise
+                # Back off on quota/rate-limit errors; do not retry other failures.
+                delay = min(30, 2 ** attempt * 2)
+                app.logger.warning(
+                    "Gemini rate limit on attempt %s; retrying in %s seconds",
+                    attempt + 1, delay
+                )
+                time.sleep(delay)
 
-    if not response_text:
-        raise ValueError("Gemini returned an empty response.")
+        response_text = get_field(response, "text", "")
+        if not response_text:
+            raise ValueError("Gemini returned an empty response.")
 
-    result = json.loads(clean_json_response(response_text))
+        result = json.loads(clean_json_response(response_text))
+        if not isinstance(result, list):
+            raise ValueError("Gemini response was not a JSON array.")
 
-    if not isinstance(result, list):
-        raise ValueError("Gemini response was not a JSON array.")
+        returned = {}
+        for item in result:
+            if not isinstance(item, dict) or "id" not in item or "myanmar" not in item:
+                continue
+            try:
+                idx = int(item["id"])
+                translated = str(item["myanmar"]).strip()
+                if translated:
+                    returned[idx] = translated
+            except (TypeError, ValueError):
+                continue
 
-    translations = {}
+        missing = [item["id"] for item in uncached if item["id"] not in returned]
+        if missing:
+            raise ValueError(f"Gemini did not translate all lines. Missing IDs: {missing}")
 
-    for item in result:
-        if not isinstance(item, dict):
-            continue
+        for item in uncached:
+            idx = item["id"]
+            translations[idx] = returned[idx]
+            _cache_put(cache_keys[idx], returned[idx])
 
-        if "id" not in item or "myanmar" not in item:
-            continue
-
-        try:
-            idx = int(item["id"])
-            translated = str(item["myanmar"]).strip()
-
-            if translated:
-                translations[idx] = translated
-        except (TypeError, ValueError):
-            continue
-
-    missing = [
-        i for i in range(len(segments))
-        if i not in translations
-    ]
-
-    if missing:
-        raise ValueError(
-            f"Gemini did not translate all lines. Missing IDs: {missing}"
-        )
-
-    # Avoid silently accepting Chinese-only output.
     chinese_pattern = re.compile(r"[\u4e00-\u9fff]")
-
     for idx, translated in translations.items():
         if chinese_pattern.search(translated):
-            app.logger.warning(
-                "Translation for line %s still contains Chinese: %s",
-                idx,
-                translated
-            )
+            app.logger.warning("Translation for line %s still contains Chinese: %s", idx, translated)
 
-    return [
-        translations[i]
-        for i in range(len(segments))
-    ]
+    return [translations[i] for i in range(len(segments))]
 
 
 @app.get("/")
@@ -337,7 +369,7 @@ def process_video():
         model = genai.GenerativeModel(GEMINI_MODEL)
 
         translated_lines = []
-        batch_size = 15
+        batch_size = GEMINI_BATCH_SIZE
 
         for start_index in range(0, len(raw_segments), batch_size):
             batch = raw_segments[
@@ -359,6 +391,7 @@ def process_video():
                     error=(
                         "မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ "
                         "Render Logs မှာ Gemini error ကို စစ်ပါ။ "
+                        "Quota ပြည့်နေပါက ခဏစောင့်ပြီး ပြန်စမ်းပါ။ "
                         "GEMINI_MODEL နဲ့ API Key ကိုလည်း စစ်ပါ။"
                     )
                 ), 502
