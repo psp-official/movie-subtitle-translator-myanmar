@@ -12,7 +12,7 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
-# Maximum video upload size: 1 GB
+# Maximum upload size: 1 GB
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
@@ -20,10 +20,21 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
+# Change this model ID only if Google AI Studio shows a different
+# supported model ID for your API key.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+def get_field(obj, name, default=None):
+    """Read fields from dictionaries and API response objects."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
 
 def make_timestamp(seconds):
-    """Convert seconds into SRT timestamp format."""
-    milliseconds = int(round(max(0, float(seconds)) * 1000))
+    """Convert seconds to SRT timestamp format."""
+    milliseconds = int(round(max(0.0, float(seconds)) * 1000))
 
     hours, remainder = divmod(milliseconds, 3600000)
     minutes, remainder = divmod(remainder, 60000)
@@ -37,60 +48,96 @@ def make_timestamp(seconds):
     )
 
 
-def clean_json_response(text):
-    """Remove Markdown code fences from AI responses."""
-    text = str(text).strip()
+def format_subtitle(text, max_chars=22):
+    """Wrap Burmese subtitle text into at most two readable lines."""
+    text = re.sub(r"\s+", " ", str(text)).strip()
 
+    if not text:
+        return ""
+
+    if len(text) <= max_chars:
+        return text
+
+    # Burmese does not normally separate every word with spaces.
+    # Prefer existing spaces as line-break points.
+    words = text.split(" ")
+
+    if len(words) == 1:
+        # Avoid cutting Burmese combining characters away from
+        # the base character.
+        parts = re.findall(r".{1,22}", text)
+        return "\n".join(parts[:2]) if len(parts) <= 2 else (
+            parts[0] + "\n" + "".join(parts[1:])
+        )
+
+    lines = []
+    current = ""
+
+    for word in words:
+        candidate = f"{current} {word}".strip()
+
+        if len(candidate) <= max_chars or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    if len(lines) <= 2:
+        return "\n".join(lines)
+
+    # Keep the full text rather than silently dropping words.
+    first = lines[0]
+    remaining = " ".join(lines[1:])
+    return first + "\n" + remaining
+
+
+def clean_json_response(text):
+    """Remove Markdown fences around JSON."""
+    text = str(text or "").strip()
     text = re.sub(
         r"^```(?:json)?\s*|\s*```$",
         "",
         text,
         flags=re.IGNORECASE
     )
-
     return text.strip()
 
 
-def get_field(obj, field, default=None):
-    """Read a field from either a dictionary or an object."""
-    if isinstance(obj, dict):
-        return obj.get(field, default)
-
-    return getattr(obj, field, default)
-
-
 def translate_batch(model, segments):
-    """Translate Chinese dialogue into natural conversational Burmese."""
-
+    """Translate Chinese dialogue into natural spoken Burmese."""
     payload = [
-        {
-            "id": i,
-            "text": segment["text"]
-        }
+        {"id": i, "text": segment["text"]}
         for i, segment in enumerate(segments)
     ]
 
     prompt = f"""
-Translate the following Chinese movie dialogue into natural,
+Translate each Chinese movie dialogue line into natural,
 conversational Burmese (Myanmar language).
 
-Rules:
-- Preserve the original meaning, emotion, and character intent.
-- Use natural spoken Burmese suitable for movie subtitles.
+IMPORTANT RULES:
+- The output language MUST be Burmese.
+- Do NOT return Chinese as the translation.
+- Preserve meaning, emotion, and character intent.
 - Do not summarize or add narration.
-- Do not explain the translation.
-- Keep every ID and preserve the original order.
+- Keep the exact IDs and original order.
+- Translate every item.
 - Return ONLY a valid JSON array.
-- Each item must contain "id" and "myanmar".
-- Translate every line.
-- If a line is unclear, translate conservatively.
+- Every item must contain "id" and "myanmar".
+- If a line is unclear, provide the most conservative Burmese translation.
+
+Example format:
+[
+  {{"id": 0, "myanmar": "မြန်မာဘာသာပြန်စာသား"}}
+]
 
 Input:
 {json.dumps(payload, ensure_ascii=False)}
 """
 
     response = model.generate_content(prompt)
-
     response_text = get_field(response, "text", "")
 
     if not response_text:
@@ -99,7 +146,7 @@ Input:
     result = json.loads(clean_json_response(response_text))
 
     if not isinstance(result, list):
-        raise ValueError("Gemini response is not a JSON array.")
+        raise ValueError("Gemini response was not a JSON array.")
 
     translations = {}
 
@@ -111,15 +158,38 @@ Input:
             continue
 
         try:
-            translations[int(item["id"])] = str(
-                item["myanmar"]
-            ).strip()
+            idx = int(item["id"])
+            translated = str(item["myanmar"]).strip()
+
+            if translated:
+                translations[idx] = translated
         except (TypeError, ValueError):
             continue
 
+    missing = [
+        i for i in range(len(segments))
+        if i not in translations
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Gemini did not translate all lines. Missing IDs: {missing}"
+        )
+
+    # Avoid silently accepting Chinese-only output.
+    chinese_pattern = re.compile(r"[\u4e00-\u9fff]")
+
+    for idx, translated in translations.items():
+        if chinese_pattern.search(translated):
+            app.logger.warning(
+                "Translation for line %s still contains Chinese: %s",
+                idx,
+                translated
+            )
+
     return [
-        translations.get(i, segment["text"])
-        for i, segment in enumerate(segments)
+        translations[i]
+        for i in range(len(segments))
     ]
 
 
@@ -130,19 +200,13 @@ def home():
 
 @app.post("/api/process")
 def process_video():
-
-    # Check uploaded file
     if "video" not in request.files:
-        return jsonify(
-            error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"
-        ), 400
+        return jsonify(error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"), 400
 
     video = request.files["video"]
 
     if not video.filename:
-        return jsonify(
-            error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"
-        ), 400
+        return jsonify(error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"), 400
 
     filename = secure_filename(video.filename)
     extension = Path(filename).suffix.lower()
@@ -152,7 +216,6 @@ def process_video():
             error="MP4, MOV, MKV သို့မဟုတ် WEBM ဖိုင်ကို ရွေးပါ။"
         ), 400
 
-    # Check API keys
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
@@ -160,34 +223,27 @@ def process_video():
         return jsonify(
             error=(
                 "Render Environment Variables ထဲမှာ "
-                "GROQ_API_KEY နဲ့ GEMINI_API_KEY "
-                "နှစ်ခုလုံး ထည့်ထားကြောင်း စစ်ပါ။"
+                "GROQ_API_KEY နဲ့ GEMINI_API_KEY ထည့်ပါ။"
             )
         ), 500
 
-    # Import API libraries
     try:
         from groq import Groq
         import google.generativeai as genai
-
     except ImportError:
         app.logger.exception("Required library import failed")
-
         return jsonify(
             error="လိုအပ်သော Python libraries များ မတပ်ဆင်ရသေးပါ။"
         ), 500
 
-    # Create temporary working directory
     job_dir = Path(tempfile.mkdtemp(dir=UPLOAD_DIR))
-
     video_path = job_dir / filename
     audio_path = job_dir / "audio.mp3"
 
     try:
         video.save(video_path)
 
-        # Extract audio using FFmpeg.
-        # The original video is not modified or re-rendered.
+        # Extract audio only. Do not modify or export the video.
         command = [
             "ffmpeg",
             "-y",
@@ -208,20 +264,17 @@ def process_video():
 
         if result.returncode != 0 or not audio_path.exists():
             app.logger.error(
-                "FFmpeg audio extraction failed: %s",
+                "FFmpeg failed: %s",
                 result.stderr[-3000:]
             )
-
             return jsonify(
                 error="ဗီဒီယိုထဲက အသံကို ထုတ်ယူလို့မရပါ။"
             ), 400
 
         if audio_path.stat().st_size == 0:
-            return jsonify(
-                error="ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။"
-            ), 400
+            return jsonify(error="ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။"), 400
 
-        # Speech-to-text using Groq Whisper
+        # Transcribe Chinese speech with segment timestamps.
         groq_client = Groq(api_key=groq_key)
 
         with open(audio_path, "rb") as audio_file:
@@ -233,14 +286,11 @@ def process_video():
                 timestamp_granularities=["segment"]
             )
 
-        raw_segments = []
-
-        # Support both dictionaries and objects returned by the API.
         transcription_segments = get_field(
-            transcription,
-            "segments",
-            []
+            transcription, "segments", []
         ) or []
+
+        raw_segments = []
 
         for segment in transcription_segments:
             try:
@@ -255,10 +305,9 @@ def process_video():
                 end = float(
                     get_field(segment, "end", start) or start
                 )
-
             except (TypeError, ValueError):
                 app.logger.warning(
-                    "Skipping invalid transcription segment: %r",
+                    "Skipping invalid segment: %r",
                     segment
                 )
                 continue
@@ -283,51 +332,42 @@ def process_video():
                 )
             ), 422
 
-        # Configure Gemini for Burmese translation
+        # Translate with Gemini.
         genai.configure(api_key=gemini_key)
-
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
 
         translated_lines = []
+        batch_size = 15
 
-        # Translate in batches to avoid oversized requests
-        batch_size = 25
-
-        for start_index in range(
-            0,
-            len(raw_segments),
-            batch_size
-        ):
+        for start_index in range(0, len(raw_segments), batch_size):
             batch = raw_segments[
                 start_index:start_index + batch_size
             ]
 
             try:
                 translations = translate_batch(model, batch)
+                translated_lines.extend(translations)
 
             except Exception:
                 app.logger.exception(
-                    "Gemini translation batch failed at index %s",
+                    "Gemini translation failed at batch %s",
                     start_index
                 )
 
-                # Keep the original Chinese text for failed batches.
-                # The user can review or edit these lines.
-                translations = [
-                    item["text"] for item in batch
-                ]
+                # Do not silently show untranslated Chinese as Burmese.
+                return jsonify(
+                    error=(
+                        "မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ "
+                        "Render Logs မှာ Gemini error ကို စစ်ပါ။ "
+                        "GEMINI_MODEL နဲ့ API Key ကိုလည်း စစ်ပါ။"
+                    )
+                ), 502
 
-            translated_lines.extend(translations)
-
-        # Build subtitle editor data
+        # Prepare subtitle entries.
         items = []
 
         for index, segment in enumerate(raw_segments):
-            translated_text = (
-                translated_lines[index]
-                if index < len(translated_lines)
-                else segment["text"]
-            )
+            translated_text = translated_lines[index]
 
             items.append({
                 "index": index + 1,
@@ -335,30 +375,28 @@ def process_video():
                     f"{make_timestamp(segment['start'])} --> "
                     f"{make_timestamp(segment['end'])}"
                 ),
-                "text": translated_text,
+                "text": format_subtitle(translated_text),
                 "source": segment["text"]
             })
 
         return jsonify(
             items=items,
             notice=(
-                "အသံမှ စကားပြောကို ဖမ်းယူပြီး ဘာသာပြန်ထားပါပြီ။ "
-                "SRT မဒေါင်းလုဒ်ခင် စာတန်းများကို ပြန်စစ်ပါ။ "
-                "ဗီဒီယိုပေါ်က တရုတ်စာတန်း OCR ကို "
-                "ဒီဗားရှင်းမှာ မထည့်ရသေးပါ။"
+                "မြန်မာဘာသာပြန်ပြီးပါပြီ။ "
+                "အချိန်များသည် မူရင်းစကားပြော segment များအပေါ် "
+                "အခြေခံထားပါသည်။ စာတန်းများကို ပြန်စစ်ပြီး SRT ထုတ်ပါ။ "
+                "ဗီဒီယိုထဲက မြင်ရသော တရုတ်စာတန်း OCR မပါသေးပါ။"
             )
         )
 
     except subprocess.TimeoutExpired:
-        app.logger.exception("FFmpeg processing timed out")
-
+        app.logger.exception("FFmpeg timed out")
         return jsonify(
             error="ဗီဒီယိုအသံထုတ်ယူချိန် ကျော်လွန်သွားပါတယ်။"
         ), 504
 
     except Exception:
         app.logger.exception("Video processing failed")
-
         return jsonify(
             error=(
                 "လုပ်ဆောင်မှု မအောင်မြင်ပါ။ "
@@ -367,20 +405,16 @@ def process_video():
         ), 500
 
     finally:
-        # Delete temporary video/audio files after processing
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @app.post("/api/export")
 def export_srt():
-
     data = request.get_json(silent=True) or {}
     items = data.get("items", [])
 
     if not isinstance(items, list):
-        return jsonify(
-            error="Subtitle data မမှန်ပါ။"
-        ), 400
+        return jsonify(error="Subtitle data မမှန်ပါ။"), 400
 
     output = []
 
@@ -394,7 +428,6 @@ def export_srt():
         if "-->" not in timestamp or not text:
             continue
 
-        # Prevent malformed SRT blocks
         output.append(
             f"{len(output) + 1}\n"
             f"{timestamp}\n"
