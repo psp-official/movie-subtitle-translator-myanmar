@@ -28,6 +28,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 # Tune these in Render Environment Variables without changing the code.
 GEMINI_BATCH_SIZE = max(1, min(40, int(os.getenv("GEMINI_BATCH_SIZE", "25"))))
 GEMINI_RETRIES = max(0, min(5, int(os.getenv("GEMINI_RETRIES", "3"))))
+# Positive value delays subtitles slightly to compensate for early Whisper segment starts.
+SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
 TRANSLATION_CACHE_MAX = 5000
 # In-memory cache: avoids repeat Gemini calls within the same running worker.
 # It clears when the service restarts and is not shared between workers.
@@ -315,12 +317,16 @@ def process_video():
                 model="whisper-large-v3",
                 language="zh",
                 response_format="verbose_json",
-                timestamp_granularities=["segment"]
+                timestamp_granularities=["word", "segment"]
             )
 
         transcription_segments = get_field(
             transcription, "segments", []
         ) or []
+        # Word-level timestamps let each subtitle start at the first detected
+        # spoken word inside its Whisper segment, instead of using a fixed
+        # offset for every movie. Fall back to segment timestamps if absent.
+        transcription_words = get_field(transcription, "words", []) or []
 
         raw_segments = []
 
@@ -347,8 +353,29 @@ def process_video():
             if not text:
                 continue
 
-            start = max(0.0, start)
-            end = max(start + 0.15, end)
+            # Refine start using the first word timestamp inside this segment.
+            # This adapts per segment/movie instead of shifting all subtitles
+            # by one fixed delay. Segment timestamps remain the fallback.
+            if transcription_words:
+                candidate_starts = []
+                candidate_ends = []
+                for word in transcription_words:
+                    try:
+                        word_start = float(get_field(word, "start", -1))
+                        word_end = float(get_field(word, "end", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if word_start >= max(0.0, start - 0.15) and word_start <= end + 0.05:
+                        candidate_starts.append(word_start)
+                        if word_end >= word_start:
+                            candidate_ends.append(word_end)
+                if candidate_starts:
+                    start = min(candidate_starts)
+                if candidate_ends:
+                    end = max(end, max(candidate_ends))
+
+            start = max(0.0, start + SUBTITLE_DELAY_SECONDS)
+            end = max(start + 0.15, end + SUBTITLE_DELAY_SECONDS)
 
             raw_segments.append({
                 "start": start,
