@@ -114,14 +114,25 @@ Input: {json.dumps(uncached, ensure_ascii=False)}"""
 
     return [translations[i] for i in range(len(segments))]
 
-def check_has_hardcoded_subs(video_path):
-    import cv2
+def get_ocr_instance():
     from paddleocr import PaddleOCR
     import logging
     logging.getLogger("ppocr").setLevel(logging.ERROR)
-    
+    # Disable IR optimization and MKLDNN to prevent AVX/SIGILL crashes on Render CPUs
+    return PaddleOCR(
+        use_angle_cls=False, 
+        lang='ch', 
+        use_gpu=False, 
+        show_log=False,
+        ir_optim=False,
+        enable_mkldnn=False,
+        use_tensorrt=False
+    )
+
+def check_has_hardcoded_subs(video_path):
+    import cv2
     try:
-        ocr = PaddleOCR(use_angle_cls=False, lang='ch', use_gpu=False, show_log=False)
+        ocr = get_ocr_instance()
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 0: fps = 25.0
@@ -157,12 +168,9 @@ def check_has_hardcoded_subs(video_path):
 
 def run_ocr_extraction(video_path):
     import cv2
-    from paddleocr import PaddleOCR
     from difflib import SequenceMatcher
-    import logging
     
-    logging.getLogger("ppocr").setLevel(logging.ERROR)
-    ocr = PaddleOCR(use_angle_cls=False, lang='ch', use_gpu=False, show_log=False)
+    ocr = get_ocr_instance()
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0: fps = 25.0
