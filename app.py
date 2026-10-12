@@ -114,25 +114,12 @@ Input: {json.dumps(uncached, ensure_ascii=False)}"""
 
     return [translations[i] for i in range(len(segments))]
 
-def get_ocr_instance():
-    from paddleocr import PaddleOCR
-    import logging
-    logging.getLogger("ppocr").setLevel(logging.ERROR)
-    # Disable IR optimization and MKLDNN to prevent AVX/SIGILL crashes on Render CPUs
-    return PaddleOCR(
-        use_angle_cls=False, 
-        lang='ch', 
-        use_gpu=False, 
-        show_log=False,
-        ir_optim=False,
-        enable_mkldnn=False,
-        use_tensorrt=False
-    )
-
 def check_has_hardcoded_subs(video_path):
     import cv2
+    from rapidocr_onnxruntime import RapidOCR
+    
     try:
-        ocr = get_ocr_instance()
+        ocr = RapidOCR()
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 0: fps = 25.0
@@ -150,14 +137,16 @@ def check_has_hardcoded_subs(video_path):
             
             if frame_count % frame_interval == 0:
                 h, w, _ = frame.shape
-                crop = frame[int(h*0.75):h, :]
-                result = ocr.ocr(crop, cls=False)
+                # Expanded to 60% to support vertical (9:16) videos where subtitle is in the middle
+                crop = frame[int(h*0.4):h, :]
                 
-                if result and result[0]:
-                    text = "".join([line[1][0] for line in result[0] if line[1][1] > 0.6])
+                result, _ = ocr(crop)
+                
+                if result:
+                    text = "".join([line[1] for line in result if line[2] > 0.6])
                     if re.search(r'[\u4e00-\u9fff]', text):
                         chinese_frames += 1
-                        if chinese_frames >= 5:
+                        if chinese_frames >= 3:
                             cap.release()
                             return True
             frame_count += 1
@@ -168,14 +157,16 @@ def check_has_hardcoded_subs(video_path):
 
 def run_ocr_extraction(video_path):
     import cv2
+    from rapidocr_onnxruntime import RapidOCR
     from difflib import SequenceMatcher
     
-    ocr = get_ocr_instance()
+    ocr = RapidOCR()
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0: fps = 25.0
     
-    frame_interval = int(max(1, round(fps / 2))) # 2 fps
+    # Increased to 4 fps for higher precision (perfect sync for subtitle appearance/disappearance)
+    frame_interval = int(max(1, round(fps / 4))) 
     
     segments = []
     current_text = ""
@@ -190,18 +181,21 @@ def run_ocr_extraction(video_path):
         
         if frame_count % frame_interval == 0:
             h, w, _ = frame.shape
-            crop = frame[int(h*0.75):h, :]
-            result = ocr.ocr(crop, cls=False)
+            # Expanded to 60% to support vertical (9:16) videos
+            crop = frame[int(h*0.4):h, :]
+            
+            result, _ = ocr(crop)
             
             frame_text = ""
-            if result and result[0]:
-                lines = [line[1][0] for line in result[0] if line[1][1] > 0.6]
+            if result:
+                # Filter out everything except Chinese text to prevent UI from breaking continuity
+                lines = [line[1] for line in result if line[2] > 0.6 and re.search(r'[\u4e00-\u9fff]', line[1])]
                 frame_text = " ".join(lines).strip()
             
             timestamp = frame_count / fps
             similarity = SequenceMatcher(None, current_text, frame_text).ratio()
             
-            if similarity < 0.7 or not frame_text:
+            if similarity < 0.6 or not frame_text:
                 if current_text and re.search(r'[\u4e00-\u9fff]', current_text):
                     segments.append({"start": current_start, "end": timestamp, "text": current_text})
                 current_text = frame_text
@@ -214,9 +208,9 @@ def run_ocr_extraction(video_path):
         
     cap.release()
     
-    final_segments = [s for s in segments if (s["end"] - s["start"]) > 0.3]
+    # Filter out glitches shorter than 0.2s
+    final_segments = [s for s in segments if (s["end"] - s["start"]) > 0.2]
     return final_segments
-
 
 @app.get("/")
 def home():
@@ -278,14 +272,44 @@ def process_video():
             with open(audio_path, "rb") as audio_file:
                 transcription = groq_client.audio.transcriptions.create(file=(audio_path.name, audio_file.read()), model="whisper-large-v3", language="zh", response_format="verbose_json", timestamp_granularities=["word", "segment"])
                 
-            for segment in get_field(transcription, "segments", []) or []:
+            transcription_segments = get_field(transcription, "segments", []) or []
+            transcription_words = get_field(transcription, "words", []) or []
+            if not transcription_words:
+                nested_words = []
+                for _segment in transcription_segments:
+                    nested_words.extend(get_field(_segment, "words", []) or [])
+                transcription_words = nested_words
+
+            for segment in transcription_segments:
                 text = str(get_field(segment, "text", "") or "").strip()
                 if not text: continue
                 start = float(get_field(segment, "start", 0))
                 end = float(get_field(segment, "end", start))
                 
+                # Use exact word-level boundaries for perfect audio sync
+                if transcription_words:
+                    owned_words = []
+                    for word in transcription_words:
+                        try:
+                            word_start = float(get_field(word, "start", -1))
+                            word_end = float(get_field(word, "end", -1))
+                        except: continue
+                        if word_start < 0 or word_end <= word_start: continue
+                        
+                        midpoint = (word_start + word_end) / 2.0
+                        if start - 0.5 <= midpoint <= end + 0.5:
+                            owned_words.append((word_start, word_end))
+                    
+                    if owned_words:
+                        start = min(item[0] for item in owned_words)
+                        end = max(item[1] for item in owned_words)
+                
                 total_delay = SUBTITLE_DELAY_SECONDS + user_delay
-                raw_segments.append({"start": max(0.0, start + total_delay), "end": max(start + 0.15, end + total_delay), "text": text})
+                raw_segments.append({
+                    "start": max(0.0, start + total_delay), 
+                    "end": max(start + 0.1, end + total_delay), 
+                    "text": text
+                })
 
             if not raw_segments: return jsonify(error="စကားပြောစာသား မတွေ့ပါ။"), 422
             raw_segments.sort(key=lambda item: (item["start"], item["end"]))
