@@ -239,6 +239,11 @@ def process_video():
 
     video = request.files["video"]
 
+    try:
+        user_delay = float(request.form.get("delay", 0.0))
+    except ValueError:
+        user_delay = 0.0
+
     if not video.filename:
         return jsonify(error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"), 400
 
@@ -385,8 +390,9 @@ def process_video():
                     end = max(item[1] for item in owned_words)
 
             # No global fixed delay: each subtitle follows its own detected speech.
-            start = max(0.0, start + SUBTITLE_DELAY_SECONDS)
-            end = max(start + 0.15, end + SUBTITLE_DELAY_SECONDS)
+            total_delay = SUBTITLE_DELAY_SECONDS + user_delay
+            start = max(0.0, start + total_delay)
+            end = max(start + 0.15, end + total_delay)
 
             raw_segments.append({
                 "start": start,
