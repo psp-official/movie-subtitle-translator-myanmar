@@ -353,27 +353,32 @@ def process_video():
             if not text:
                 continue
 
-            # Refine start using the first word timestamp inside this segment.
-            # This adapts per segment/movie instead of shifting all subtitles
-            # by one fixed delay. Segment timestamps remain the fallback.
+            # Prefer word timestamps that actually belong to this segment.
+            # Assign each word by its midpoint so words from adjacent segments
+            # are not accidentally used to move this subtitle earlier/later.
             if transcription_words:
-                candidate_starts = []
-                candidate_ends = []
+                owned_words = []
                 for word in transcription_words:
                     try:
                         word_start = float(get_field(word, "start", -1))
                         word_end = float(get_field(word, "end", -1))
                     except (TypeError, ValueError):
                         continue
-                    if word_start >= max(0.0, start - 0.15) and word_start <= end + 0.05:
-                        candidate_starts.append(word_start)
-                        if word_end >= word_start:
-                            candidate_ends.append(word_end)
-                if candidate_starts:
-                    start = min(candidate_starts)
-                if candidate_ends:
-                    end = max(end, max(candidate_ends))
+                    if word_start < 0 or word_end < word_start:
+                        continue
+                    midpoint = (word_start + word_end) / 2.0
+                    if start - 0.02 <= midpoint <= end + 0.02:
+                        owned_words.append((word_start, word_end))
 
+                if owned_words:
+                    # Word-level boundaries better approximate the actual speech
+                    # onset/offset than broad Whisper segment boundaries.
+                    start = min(item[0] for item in owned_words)
+                    word_end = max(item[1] for item in owned_words)
+                    if word_end > start:
+                        end = word_end
+
+            # No global fixed delay: each subtitle follows its own detected speech.
             start = max(0.0, start + SUBTITLE_DELAY_SECONDS)
             end = max(start + 0.15, end + SUBTITLE_DELAY_SECONDS)
 
