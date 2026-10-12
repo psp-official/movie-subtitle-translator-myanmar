@@ -158,6 +158,18 @@
       အသံကိုဖတ်ယူပြီး SRT ဖိုင်ထုတ်ပေးမည်။
     </p>
 
+    <label for="delaySeconds" style="margin-top: 15px; display: block; margin-bottom: 12px; font-weight: bold;">၂။ စာတန်းနောက်ဆုတ်ရန် (စက္ကန့်)</label>
+    <input 
+      id="delaySeconds" 
+      type="number" 
+      step="0.1" 
+      value="0.0" 
+      style="width: 100%; padding: 14px; border: 1px dashed #7771cc; border-radius: 10px; background: #0b1020; color: white;"
+    >
+    <p class="muted">
+      စာတန်းက အသံထက် စောပေါ်နေပါက 0.5 သို့မဟုတ် 1.0 စသဖြင့် ထည့်ပါ။ ပုံမှန်ဆိုလျှင် 0.0 အတိုင်းထားပါ။
+    </p>
+
     <div class="actions">
       <button id="process">ဘာသာပြန်မယ်</button>
 
@@ -261,6 +273,7 @@
     try {
       const form = new FormData();
       form.append("video", file);
+      form.append("delay", $("delaySeconds").value);
 
       const response = await fetch("/api/process", {
         method: "POST",
