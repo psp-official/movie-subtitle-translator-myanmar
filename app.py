@@ -19,9 +19,9 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_BATCH_SIZE = max(1, min(40, int(os.getenv("GEMINI_BATCH_SIZE", "25"))))
-GEMINI_RETRIES = max(0, min(5, int(os.getenv("GEMINI_RETRIES", "3"))))
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "25"))))
+API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
 TRANSLATION_CACHE_MAX = 5000
 TRANSLATION_CACHE = OrderedDict()
@@ -72,7 +72,7 @@ def _cache_put(key, value):
     TRANSLATION_CACHE.move_to_end(key)
     while len(TRANSLATION_CACHE) > TRANSLATION_CACHE_MAX: TRANSLATION_CACHE.popitem(last=False)
 
-def translate_batch(model, segments):
+def translate_batch(client, segments):
     translations = {}
     uncached = []
     cache_keys = {}
@@ -83,22 +83,25 @@ def translate_batch(model, segments):
         else: uncached.append({"id": idx, "text": segment["text"]})
 
     if uncached:
-        prompt = f"""You are a professional Chinese-to-Myanmar subtitle translator.
-Translate each Chinese dialogue line into natural spoken Burmese.
-RULES: Output Burmese only. Preserve meaning, emotion. No narration. Keep concise. Return ONLY valid JSON array with integer "id" and string "myanmar".
-Example: [{{"id": 0, "myanmar": "မင်း ဘာလုပ်နေတာလဲ။"}}]
-Input: {json.dumps(uncached, ensure_ascii=False)}"""
         response = None
-        for attempt in range(GEMINI_RETRIES + 1):
+        for attempt in range(API_RETRIES + 1):
             try:
-                response = model.generate_content(prompt)
+                response = client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a professional Chinese-to-Myanmar subtitle translator. Translate each Chinese dialogue line into natural spoken Burmese. RULES: Output Burmese only. Preserve meaning, emotion. No narration. Keep concise. Return ONLY a valid JSON array with integer 'id' and string 'myanmar'. Example: [{\"id\": 0, \"myanmar\": \"မင်း ဘာလုပ်နေတာလဲ။\"}]"},
+                        {"role": "user", "content": f"Input: {json.dumps(uncached, ensure_ascii=False)}"}
+                    ],
+                    temperature=0.3
+                )
                 break
             except Exception as exc:
-                if attempt >= GEMINI_RETRIES: raise
+                if attempt >= API_RETRIES: raise
                 time.sleep(min(30, 2 ** attempt * 2))
 
-        response_text = get_field(response, "text", "")
+        response_text = response.choices[0].message.content if response else ""
         if not response_text: raise ValueError("Empty response.")
+        
         result = json.loads(clean_json_response(response_text))
         
         returned = {}
@@ -137,7 +140,6 @@ def check_has_hardcoded_subs(video_path):
             
             if frame_count % frame_interval == 0:
                 h, w, _ = frame.shape
-                # Expanded to 60% to support vertical (9:16) videos where subtitle is in the middle
                 crop = frame[int(h*0.4):h, :]
                 
                 result, _ = ocr(crop)
@@ -165,7 +167,6 @@ def run_ocr_extraction(video_path):
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0: fps = 25.0
     
-    # Increased to 4 fps for higher precision (perfect sync for subtitle appearance/disappearance)
     frame_interval = int(max(1, round(fps / 4))) 
     
     segments = []
@@ -181,14 +182,12 @@ def run_ocr_extraction(video_path):
         
         if frame_count % frame_interval == 0:
             h, w, _ = frame.shape
-            # Expanded to 60% to support vertical (9:16) videos
             crop = frame[int(h*0.4):h, :]
             
             result, _ = ocr(crop)
             
             frame_text = ""
             if result:
-                # Filter out everything except Chinese text to prevent UI from breaking continuity
                 lines = [line[1] for line in result if line[2] > 0.6 and re.search(r'[\u4e00-\u9fff]', line[1])]
                 frame_text = " ".join(lines).strip()
             
@@ -208,7 +207,6 @@ def run_ocr_extraction(video_path):
         
     cap.release()
     
-    # Filter out glitches shorter than 0.2s
     final_segments = [s for s in segments if (s["end"] - s["start"]) > 0.2]
     return final_segments
 
@@ -231,12 +229,12 @@ def process_video():
         return jsonify(error="MP4, MOV, MKV သို့မဟုတ် WEBM ဖိုင်ကို ရွေးပါ။"), 400
 
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not groq_key or not gemini_key: return jsonify(error="GROQ_API_KEY နဲ့ GEMINI_API_KEY ထည့်ပါ။"), 500
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not groq_key or not deepseek_key: return jsonify(error="GROQ_API_KEY နှင့် DEEPSEEK_API_KEY ထည့်သွင်းထားခြင်းမရှိပါ။"), 500
 
     try:
         from groq import Groq
-        import google.generativeai as genai
+        from openai import OpenAI
     except ImportError: return jsonify(error="Libraries များ မတပ်ဆင်ရသေးပါ။"), 500
 
     job_dir = Path(tempfile.mkdtemp(dir=UPLOAD_DIR))
@@ -246,7 +244,6 @@ def process_video():
     try:
         video.save(video_path)
         
-        # Determine extraction mode
         use_ocr = False
         if mode == "ocr": use_ocr = True
         elif mode == "auto": use_ocr = check_has_hardcoded_subs(video_path)
@@ -263,7 +260,6 @@ def process_video():
                 raw_segments = []
                 
         if not raw_segments:
-            # Fallback to Audio / Whisper
             source_type = "အသံဖမ်းစနစ်(Whisper) ဖြင့် ဖတ်ယူထားပါသည်။"
             subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio_path)], capture_output=True, text=True, timeout=1800)
             if audio_path.stat().st_size == 0: return jsonify(error="ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။"), 400
@@ -286,7 +282,6 @@ def process_video():
                 start = float(get_field(segment, "start", 0))
                 end = float(get_field(segment, "end", start))
                 
-                # Use exact word-level boundaries for perfect audio sync
                 if transcription_words:
                     owned_words = []
                     for word in transcription_words:
@@ -317,14 +312,15 @@ def process_video():
                 if raw_segments[index]["end"] > raw_segments[index + 1]["start"]:
                     raw_segments[index]["end"] = max(raw_segments[index]["start"] + 0.15, raw_segments[index + 1]["start"])
 
-        # Translate with Gemini
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        # Translate with DeepSeek
+        deepseek_client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
         translated_lines = []
-        for start_index in range(0, len(raw_segments), GEMINI_BATCH_SIZE):
-            batch = raw_segments[start_index:start_index + GEMINI_BATCH_SIZE]
-            try: translated_lines.extend(translate_batch(model, batch))
-            except Exception: return jsonify(error="မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။"), 502
+        for start_index in range(0, len(raw_segments), API_BATCH_SIZE):
+            batch = raw_segments[start_index:start_index + API_BATCH_SIZE]
+            try: translated_lines.extend(translate_batch(deepseek_client, batch))
+            except Exception as e: 
+                app.logger.error(f"Translation error: {e}")
+                return jsonify(error="မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ (DeepSeek API Error)"), 502
 
         items = []
         for index, segment in enumerate(raw_segments):
