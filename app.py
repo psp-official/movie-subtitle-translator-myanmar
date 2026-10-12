@@ -327,6 +327,15 @@ def process_video():
         # spoken word inside its Whisper segment, instead of using a fixed
         # offset for every movie. Fall back to segment timestamps if absent.
         transcription_words = get_field(transcription, "words", []) or []
+        # Some transcription responses expose word timestamps under each
+        # segment rather than at the top level. Collect both response shapes.
+        if not transcription_words:
+            nested_words = []
+            for _segment in transcription_segments:
+                nested_words.extend(
+                    get_field(_segment, "words", []) or []
+                )
+            transcription_words = nested_words
 
         raw_segments = []
 
@@ -354,29 +363,26 @@ def process_video():
                 continue
 
             # Prefer word timestamps that actually belong to this segment.
-            # Assign each word by its midpoint so words from adjacent segments
-            # are not accidentally used to move this subtitle earlier/later.
+            # A segment's midpoint can be inaccurate for long segments, so use
+            # overlap with its original interval and tolerate small boundary drift.
             if transcription_words:
                 owned_words = []
+                original_start, original_end = start, end
                 for word in transcription_words:
                     try:
                         word_start = float(get_field(word, "start", -1))
                         word_end = float(get_field(word, "end", -1))
                     except (TypeError, ValueError):
                         continue
-                    if word_start < 0 or word_end < word_start:
+                    if word_start < 0 or word_end <= word_start:
                         continue
                     midpoint = (word_start + word_end) / 2.0
-                    if start - 0.02 <= midpoint <= end + 0.02:
+                    if original_start - 0.15 <= midpoint <= original_end + 0.15:
                         owned_words.append((word_start, word_end))
 
                 if owned_words:
-                    # Word-level boundaries better approximate the actual speech
-                    # onset/offset than broad Whisper segment boundaries.
                     start = min(item[0] for item in owned_words)
-                    word_end = max(item[1] for item in owned_words)
-                    if word_end > start:
-                        end = word_end
+                    end = max(item[1] for item in owned_words)
 
             # No global fixed delay: each subtitle follows its own detected speech.
             start = max(0.0, start + SUBTITLE_DELAY_SECONDS)
@@ -395,6 +401,19 @@ def process_video():
                     "အသံပါသော တရုတ်ဗီဒီယိုနဲ့ ပြန်စမ်းပါ။"
                 )
             ), 422
+
+        # Prevent timestamp overlaps between adjacent subtitle entries. This only
+        # trims a preceding cue at the next cue's speech onset; it does not apply
+        # a global offset or extend subtitles through silence.
+        raw_segments.sort(key=lambda item: (item["start"], item["end"]))
+        for index in range(len(raw_segments) - 1):
+            current = raw_segments[index]
+            following = raw_segments[index + 1]
+            if current["end"] > following["start"]:
+                current["end"] = max(
+                    current["start"] + 0.15,
+                    following["start"]
+                )
 
         # Translate with Gemini.
         genai.configure(api_key=gemini_key)
