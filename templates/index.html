@@ -110,7 +110,7 @@
     if (!file) { setStatus("ဗီဒီယိုဖိုင်ကို အရင်ရွေးပေးပါ။"); return; }
     
     $("process").disabled = true;
-    setStatus("လုပ်ဆောင်နေပါပြီ။ OCR ဖတ်ပါက ဗီဒီယိုကြာချိန်ပေါ်မူတည်ပြီး အချိန်အတော်ကြာ စောင့်ရနိုင်ပါတယ်။");
+    setStatus("လုပ်ဆောင်နေပါပြီ။ ကျေးဇူးပြု၍ စောင့်ပါ။");
     
     try {
       const form = new FormData();
@@ -122,7 +122,14 @@
         method: "POST",
         body: form
       });
-      const data = await response.json();
+      
+      const textResponse = await response.text();
+      let data;
+      try {
+          data = JSON.parse(textResponse);
+      } catch (err) {
+          throw new Error("Server မှ HTML Error ပြန်လာပါသည်။ (Backend Error သို့မဟုတ် Memory အခက်အခဲ ဖြစ်နိုင်သည်)");
+      }
       
       if (!response.ok) throw new Error(data.error || "မအောင်မြင်ပါ။");
       
