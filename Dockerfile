@@ -3,7 +3,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies needed for FFmpeg and OpenCV (PaddleOCR)
-RUN apt-get update && apt-get install -y     ffmpeg     libgl1-mesa-glx     libglib2.0-0     && rm -rf /var/lib/apt/lists/*
+# Note: libgl1-mesa-glx is replaced by libgl1 in newer Debian versions
+RUN apt-get update && apt-get install -y     ffmpeg     libgl1     libglib2.0-0     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
