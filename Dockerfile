@@ -1,18 +1,28 @@
+
 FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PORT=5000
 
 WORKDIR /app
 
-# Install system dependencies needed for FFmpeg and OpenCV (PaddleOCR)
-# Note: libgl1-mesa-glx is replaced by libgl1 in newer Debian versions
-RUN apt-get update && apt-get install -y     ffmpeg     libgl1     libglib2.0-0     && rm -rf /var/lib/apt/lists/*
+# Install FFmpeg for audio extraction
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
+# Install Python dependencies
 COPY requirements.txt .
-
-# Install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy application source code
+COPY app.py .
+COPY templates/ ./templates/
+
+# Temporary uploads
+RUN mkdir -p /tmp/movie_subtitle_uploads
 
 EXPOSE 5000
 
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "1800"]
+CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT} --workers 1 --threads 4 --timeout 1800"]
