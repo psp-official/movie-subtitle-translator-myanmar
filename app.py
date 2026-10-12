@@ -5,6 +5,7 @@ import tempfile
 import subprocess
 import shutil
 import time
+import traceback
 from collections import OrderedDict
 from pathlib import Path
 from io import BytesIO
@@ -304,6 +305,9 @@ def process_video():
 
         return jsonify(items=items, notice=f"မြန်မာဘာသာပြန်ပြီးပါပြီ။ {source_type} စာတန်းများကို ပြန်စစ်ပြီး SRT ထုတ်ပါ။")
 
+    except Exception as e:
+        app.logger.error(f"Global Error: {traceback.format_exc()}")
+        return jsonify(error="စနစ်ချို့ယွင်းမှု ဖြစ်ပေါ်သွားပါသည်။ Console Log ကို စစ်ဆေးပါ။"), 500
     finally: shutil.rmtree(job_dir, ignore_errors=True)
 
 @app.post("/api/export")
@@ -314,5 +318,13 @@ def export_srt():
         timestamp, text = str(item.get("time", "")).strip(), str(item.get("text", "")).strip()
         if "-->" in timestamp and text: output.append(f"{len(output) + 1}\n{timestamp}\n{text}")
     return send_file(BytesIO(("\n\n".join(output) + "\n").encode("utf-8-sig")), mimetype="application/x-subrip", as_attachment=True, download_name="myanmar_subtitles.srt")
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify(error="Internal Server Error: Backend တွင် ပြဿနာရှိနေပါသည်။"), 500
+
+@app.errorhandler(413)
+def file_too_large(e):
+    return jsonify(error="ဖိုင်အရွယ်အစား ကြီးလွန်းပါသည်။"), 413
 
 if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
