@@ -19,7 +19,7 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_BATCH_SIZE = max(1, min(40, int(os.getenv("GEMINI_BATCH_SIZE", "25"))))
 GEMINI_RETRIES = max(0, min(5, int(os.getenv("GEMINI_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
