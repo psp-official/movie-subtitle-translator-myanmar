@@ -19,8 +19,9 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "25"))))
+# Groq တွင် အခမဲ့ပေးထားသော စာသားဘာသာပြန်မော်ဒယ်
+GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
+API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "20"))))
 API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
 TRANSLATION_CACHE_MAX = 5000
@@ -87,7 +88,7 @@ def translate_batch(client, segments):
         for attempt in range(API_RETRIES + 1):
             try:
                 response = client.chat.completions.create(
-                    model=DEEPSEEK_MODEL,
+                    model=GROQ_LLM_MODEL,
                     messages=[
                         {"role": "system", "content": "You are a professional Chinese-to-Myanmar subtitle translator. Translate each Chinese dialogue line into natural spoken Burmese. RULES: Output Burmese only. Preserve meaning, emotion. No narration. Keep concise. Return ONLY a valid JSON array with integer 'id' and string 'myanmar'. Example: [{\"id\": 0, \"myanmar\": \"မင်း ဘာလုပ်နေတာလဲ။\"}]"},
                         {"role": "user", "content": f"Input: {json.dumps(uncached, ensure_ascii=False)}"}
@@ -127,8 +128,8 @@ def check_has_hardcoded_subs(video_path):
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 0: fps = 25.0
         
-        frame_interval = int(max(1, round(fps))) # 1 fps
-        max_scan_frames = int(fps * 60) # Scan up to 60 sec
+        frame_interval = int(max(1, round(fps))) 
+        max_scan_frames = int(fps * 60) 
         
         frame_count = 0
         chinese_frames = 0
@@ -229,12 +230,12 @@ def process_video():
         return jsonify(error="MP4, MOV, MKV သို့မဟုတ် WEBM ဖိုင်ကို ရွေးပါ။"), 400
 
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not groq_key or not deepseek_key: return jsonify(error="GROQ_API_KEY နှင့် DEEPSEEK_API_KEY ထည့်သွင်းထားခြင်းမရှိပါ။"), 500
+    
+    if not groq_key: 
+        return jsonify(error="GROQ_API_KEY ထည့်သွင်းထားခြင်းမရှိပါ။"), 500
 
     try:
         from groq import Groq
-        from openai import OpenAI
     except ImportError: return jsonify(error="Libraries များ မတပ်ဆင်ရသေးပါ။"), 500
 
     job_dir = Path(tempfile.mkdtemp(dir=UPLOAD_DIR))
@@ -250,6 +251,7 @@ def process_video():
         
         raw_segments = []
         source_type = ""
+        groq_client = Groq(api_key=groq_key)
         
         if use_ocr:
             try:
@@ -264,7 +266,6 @@ def process_video():
             subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio_path)], capture_output=True, text=True, timeout=1800)
             if audio_path.stat().st_size == 0: return jsonify(error="ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။"), 400
             
-            groq_client = Groq(api_key=groq_key)
             with open(audio_path, "rb") as audio_file:
                 transcription = groq_client.audio.transcriptions.create(file=(audio_path.name, audio_file.read()), model="whisper-large-v3", language="zh", response_format="verbose_json", timestamp_granularities=["word", "segment"])
                 
@@ -312,15 +313,14 @@ def process_video():
                 if raw_segments[index]["end"] > raw_segments[index + 1]["start"]:
                     raw_segments[index]["end"] = max(raw_segments[index]["start"] + 0.15, raw_segments[index + 1]["start"])
 
-        # Translate with DeepSeek
-        deepseek_client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
+        # Translate with Groq LLM (Llama 3)
         translated_lines = []
         for start_index in range(0, len(raw_segments), API_BATCH_SIZE):
             batch = raw_segments[start_index:start_index + API_BATCH_SIZE]
-            try: translated_lines.extend(translate_batch(deepseek_client, batch))
+            try: translated_lines.extend(translate_batch(groq_client, batch))
             except Exception as e: 
                 app.logger.error(f"Translation error: {e}")
-                return jsonify(error="မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ (DeepSeek API Error)"), 502
+                return jsonify(error="မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ (Groq LLM API Error)"), 502
 
         items = []
         for index, segment in enumerate(raw_segments):
