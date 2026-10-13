@@ -21,9 +21,9 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-# OpenRouter တွင် ၂၀၂၆ အောက်တိုဘာလ၌ အခမဲ့ပေးထားသော မော်ဒယ်များထဲမှ အကောင်းဆုံးမော်ဒယ်
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "thinkingmachines/inkling-small:free")
-API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "20"))))
+# အကောင်းဆုံးနှင့် မြန်မာစာအမှန်ကန်ဆုံး Free မော်ဒယ်ကိုသာ Default ထားပါသည်
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct:free")
+API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "15"))))
 API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
 TRANSLATION_CACHE_MAX = 5000
@@ -88,16 +88,12 @@ def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
     if uncached:
         response = None
         
-        # ၂၀၂၆ အောက်တိုဘာလတွင် OpenRouter ၌ တကယ်ရနေသော အခမဲ့မော်ဒယ်များကို အပ်ဒိတ်လုပ်ထားပါသည်
+        # စွမ်းဆောင်ရည်အမြင့်ဆုံး 70B+ အဆင့်ရှိသော မြန်မာစာအထောက်အပံ့ကောင်းသည့် Free Models များကိုသာ သုံးပါမည်
         fallback_models = [
-            "thinkingmachines/inkling-small:free",
-            "thinkingmachines/inkling:free",
-            "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "google/gemma-4-26b-a4b-it:free",
-            "cohere/north-mini-code:free",
-            "dots-studio/dots-3-note-preview:free",
-            "poolside/laguna-s-2.1:free",
-            "openrouter/free" # နောက်ဆုံးအဆင့်အနေဖြင့် OpenRouter ကို အလိုအလျောက်ရွေးချယ်ခိုင်းပါမည်
+            "qwen/qwen-2.5-72b-instruct:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "google/gemini-2.0-pro-exp-0205:free",
+            "nvidia/llama-3.1-nemotron-70b-instruct:free"
         ]
 
         success = False
@@ -118,7 +114,7 @@ def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
                 except Exception as exc:
                     err_msg = str(exc)
                     app.logger.warning(f"Error with model {current_model} (Attempt {attempt+1}/{API_RETRIES}): {err_msg}")
-                    if "404" in err_msg or "unavailable" in err_msg.lower() or "no endpoints found" in err_msg.lower() or "not a valid model" in err_msg.lower():
+                    if "404" in err_msg or "unavailable" in err_msg.lower() or "no endpoints found" in err_msg.lower() or "not a valid model" in err_msg.lower() or "403" in err_msg:
                         break 
                     time.sleep(min(30, 2 ** attempt * 2))
 
@@ -169,13 +165,15 @@ def check_has_hardcoded_subs(video_path):
             
             if frame_count % frame_interval == 0:
                 h, w, _ = frame.shape
-                crop = frame[int(h*0.4):h, :]
+                # ပြင်ဆင်ချက်: ဗီဒီယို၏ အောက်ခြေ ၂၅% ကိုသာ ဖတ်ပါမည် (ဆိုင်းဘုတ်များ ဖတ်မိခြင်းမှ ကာကွယ်ရန်)
+                crop = frame[int(h*0.75):h, :]
                 
                 result, _ = ocr(crop)
                 
                 if result:
                     text = "".join([line[1] for line in result if line[2] > 0.6])
-                    if re.search(r'[\u4e00-\u9fff]', text):
+                    # တရုတ်စာလုံး အနည်းဆုံး ၂ လုံးပါမှ စာတန်းအဖြစ် သတ်မှတ်မည်
+                    if len(re.findall(r'[\u4e00-\u9fff]', text)) >= 2:
                         chinese_frames += 1
                         if chinese_frames >= 3:
                             cap.release()
@@ -211,27 +209,28 @@ def run_ocr_extraction(video_path):
         
         if frame_count % frame_interval == 0:
             h, w, _ = frame.shape
-            crop = frame[int(h*0.4):h, :]
+            # ပြင်ဆင်ချက်: ဗီဒီယို၏ အောက်ခြေ ၂၅% ကိုသာ ဖတ်ပါမည်
+            crop = frame[int(h*0.75):h, :]
             
             result, _ = ocr(crop)
             
             frame_text = ""
             if result:
-                lines = [line[1] for line in result if line[2] > 0.6 and re.search(r'[一-鿿]', line[1])]
+                lines = [line[1] for line in result if line[2] > 0.6 and len(re.findall(r'[\u4e00-\u9fff]', line[1])) >= 2]
                 frame_text = " ".join(lines).strip()
             
             timestamp = frame_count / fps
             similarity = SequenceMatcher(None, current_text, frame_text).ratio()
             
             if similarity < 0.6 or not frame_text:
-                if current_text and re.search(r'[一-鿿]', current_text):
+                if current_text and re.search(r'[\u4e00-\u9fff]', current_text):
                     segments.append({"start": current_start, "end": timestamp, "text": current_text})
                 current_text = frame_text
                 current_start = timestamp
                 
         frame_count += 1
         
-    if current_text and re.search(r'[一-鿿]', current_text):
+    if current_text and re.search(r'[\u4e00-\u9fff]', current_text):
         segments.append({"start": current_start, "end": frame_count / fps, "text": current_text})
         
     cap.release()
@@ -295,10 +294,17 @@ def process_video():
             subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio_path)], capture_output=True, text=True, timeout=1800)
             if audio_path.stat().st_size == 0: return jsonify(error="ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။"), 400
             
-            # Groq API ကို သုံးပြီး အသံဖတ်ခြင်း (Whisper)
             groq_client = Groq(api_key=groq_key)
             with open(audio_path, "rb") as audio_file:
-                transcription = groq_client.audio.transcriptions.create(file=(audio_path.name, audio_file.read()), model="whisper-large-v3", language="zh", response_format="verbose_json", timestamp_granularities=["word", "segment"])
+                # ပြင်ဆင်ချက်: Whisper သို့ တရုတ်စကားပြောဖြစ်ကြောင်း သေချာစေရန် Prompt ထည့်သွင်းထားပါသည်
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(audio_path.name, audio_file.read()), 
+                    model="whisper-large-v3", 
+                    language="zh", 
+                    prompt="这是一部中文电视剧的对话，请准确识别中文。",
+                    response_format="verbose_json", 
+                    timestamp_granularities=["word", "segment"]
+                )
                 
             transcription_segments = get_field(transcription, "segments", []) or []
             transcription_words = get_field(transcription, "words", []) or []
