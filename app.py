@@ -12,6 +12,8 @@ from io import BytesIO
 
 from flask import Flask, request, jsonify, render_template, send_file
 from werkzeug.utils import secure_filename
+import urllib.request
+import urllib.error
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
@@ -20,7 +22,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
 # OpenRouter တွင် အခမဲ့ပေးထားသော မော်ဒယ်
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "huggingfaceh4/zephyr-7b-beta:free")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-pro-exp-0205:free")
 API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "20"))))
 API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
@@ -73,7 +75,22 @@ def _cache_put(key, value):
     TRANSLATION_CACHE.move_to_end(key)
     while len(TRANSLATION_CACHE) > TRANSLATION_CACHE_MAX: TRANSLATION_CACHE.popitem(last=False)
 
-def translate_batch(client, segments):
+def check_openrouter_model(model_name):
+    # အကယ်၍ မော်ဒယ်က Down နေရင် အခြားအခမဲ့မော်ဒယ်တစ်ခုကို ပြောင်းသုံးပါမယ်
+    fallback_models = [
+        "google/gemini-2.0-pro-exp-0205:free",
+        "google/gemini-2.0-flash-lite-preview-02-05:free",
+        "mistralai/mistral-nemo:free",
+        "nvidia/llama-3.1-nemotron-70b-instruct:free",
+        "qwen/qwen-2-7b-instruct:free",
+        "meta-llama/llama-3.2-3b-instruct:free"
+    ]
+    
+    # ရွေးထားတဲ့ မော်ဒယ်ကို အရင်စစ်ကြည့်ပါမယ်။ 
+    current_model = model_name
+    return current_model # Temporarily disabled strict checking to avoid API key block during startup
+
+def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
     translations = {}
     uncached = []
     cache_keys = {}
@@ -85,10 +102,26 @@ def translate_batch(client, segments):
 
     if uncached:
         response = None
+        current_model = model_name
+        
+        fallback_models = [
+            "google/gemini-2.0-pro-exp-0205:free",
+            "google/gemini-2.0-flash-lite-preview-02-05:free",
+            "mistralai/mistral-nemo:free",
+            "nvidia/llama-3.1-nemotron-70b-instruct:free",
+            "qwen/qwen-2-7b-instruct:free",
+            "meta-llama/llama-3.2-3b-instruct:free"
+        ]
+
         for attempt in range(API_RETRIES + 1):
             try:
+                # 404 Error တက်ရင် မော်ဒယ်အသစ်ပြောင်းဖို့ အလှည့်ကျစစ်ဆေးပါတယ်
+                if attempt > 0 and attempt <= len(fallback_models):
+                    current_model = fallback_models[attempt - 1]
+                    app.logger.warning(f"Retrying with fallback model: {current_model}")
+                    
                 response = client.chat.completions.create(
-                    model=OPENROUTER_MODEL,
+                    model=current_model,
                     messages=[
                         {"role": "system", "content": "You are a professional Chinese-to-Myanmar subtitle translator. Translate each Chinese dialogue line into natural spoken Burmese. RULES: Output Burmese only. Preserve meaning, emotion. No narration. Keep concise. Return ONLY a valid JSON array with integer 'id' and string 'myanmar'. Example: [{\"id\": 0, \"myanmar\": \"မင်း ဘာလုပ်နေတာလဲ။\"}]"},
                         {"role": "user", "content": f"Input: {json.dumps(uncached, ensure_ascii=False)}"}
@@ -97,8 +130,16 @@ def translate_batch(client, segments):
                 )
                 break
             except Exception as exc:
-                if attempt >= API_RETRIES: raise
-                time.sleep(min(30, 2 ** attempt * 2))
+                err_msg = str(exc)
+                if "404" in err_msg or "unavailable" in err_msg.lower() or "no endpoints found" in err_msg.lower():
+                    # 404 error ဖြစ်ရင် ချက်ချင်းနောက်တစ်ခုပြောင်းစမ်းပါမယ်
+                    app.logger.warning(f"Model {current_model} unavailable (404). Switching model...")
+                    if attempt >= API_RETRIES and attempt >= len(fallback_models): 
+                        raise
+                    continue
+                else:
+                    if attempt >= API_RETRIES: raise
+                    time.sleep(min(30, 2 ** attempt * 2))
 
         response_text = response.choices[0].message.content if response else ""
         if not response_text: raise ValueError("Empty response.")
@@ -189,14 +230,14 @@ def run_ocr_extraction(video_path):
             
             frame_text = ""
             if result:
-                lines = [line[1] for line in result if line[2] > 0.6 and re.search(r'[\u4e00-\u9fff]', line[1])]
+                lines = [line[1] for line in result if line[2] > 0.6 and re.search(r'[一-鿿]', line[1])]
                 frame_text = " ".join(lines).strip()
             
             timestamp = frame_count / fps
             similarity = SequenceMatcher(None, current_text, frame_text).ratio()
             
             if similarity < 0.6 or not frame_text:
-                if current_text and re.search(r'[\u4e00-\u9fff]', current_text):
+                if current_text and re.search(r'[一-鿿]', current_text):
                     segments.append({"start": current_start, "end": timestamp, "text": current_text})
                 current_text = frame_text
                 current_start = timestamp
@@ -316,15 +357,19 @@ def process_video():
                 if raw_segments[index]["end"] > raw_segments[index + 1]["start"]:
                     raw_segments[index]["end"] = max(raw_segments[index]["start"] + 0.15, raw_segments[index + 1]["start"])
 
-        # OpenRouter API ကို သုံးပြီး ဘာသာပြန်ခြင်း (OpenAI Compatible)
+        # OpenRouter API ကို သုံးပြီး ဘာသာပြန်ခြင်း
         openrouter_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=openrouter_key
         )
+        
+        working_model = check_openrouter_model(OPENROUTER_MODEL)
+        
         translated_lines = []
         for start_index in range(0, len(raw_segments), API_BATCH_SIZE):
             batch = raw_segments[start_index:start_index + API_BATCH_SIZE]
-            try: translated_lines.extend(translate_batch(openrouter_client, batch))
+            try: 
+                translated_lines.extend(translate_batch(openrouter_client, batch, working_model))
             except Exception as e: 
                 app.logger.error(f"Translation error: {e}")
                 return jsonify(error="မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ (OpenRouter API Error)"), 502
