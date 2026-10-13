@@ -1,0 +1,11 @@
+
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+.git/
+.gitignore
+temp/*
+uploads/*
+outputs/*
