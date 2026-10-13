@@ -19,9 +19,9 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-# Groq တွင် အခမဲ့ပေးထားသော စာသားဘာသာပြန်မော်ဒယ်
-GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
-API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "20"))))
+# OpenRouter တွင် အခမဲ့ပေးထားသော မော်ဒယ်ကို Default အနေဖြင့် သတ်မှတ်ထားပါသည်
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-1.5-flash-8b")
+API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "25"))))
 API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
 TRANSLATION_CACHE_MAX = 5000
@@ -88,7 +88,7 @@ def translate_batch(client, segments):
         for attempt in range(API_RETRIES + 1):
             try:
                 response = client.chat.completions.create(
-                    model=GROQ_LLM_MODEL,
+                    model=OPENROUTER_MODEL,
                     messages=[
                         {"role": "system", "content": "You are a professional Chinese-to-Myanmar subtitle translator. Translate each Chinese dialogue line into natural spoken Burmese. RULES: Output Burmese only. Preserve meaning, emotion. No narration. Keep concise. Return ONLY a valid JSON array with integer 'id' and string 'myanmar'. Example: [{\"id\": 0, \"myanmar\": \"မင်း ဘာလုပ်နေတာလဲ။\"}]"},
                         {"role": "user", "content": f"Input: {json.dumps(uncached, ensure_ascii=False)}"}
@@ -230,12 +230,14 @@ def process_video():
         return jsonify(error="MP4, MOV, MKV သို့မဟုတ် WEBM ဖိုင်ကို ရွေးပါ။"), 400
 
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     
-    if not groq_key: 
-        return jsonify(error="GROQ_API_KEY ထည့်သွင်းထားခြင်းမရှိပါ။"), 500
+    if not groq_key or not openrouter_key: 
+        return jsonify(error="GROQ_API_KEY နှင့် OPENROUTER_API_KEY ထည့်သွင်းထားခြင်းမရှိပါ။"), 500
 
     try:
         from groq import Groq
+        from openai import OpenAI
     except ImportError: return jsonify(error="Libraries များ မတပ်ဆင်ရသေးပါ။"), 500
 
     job_dir = Path(tempfile.mkdtemp(dir=UPLOAD_DIR))
@@ -251,7 +253,6 @@ def process_video():
         
         raw_segments = []
         source_type = ""
-        groq_client = Groq(api_key=groq_key)
         
         if use_ocr:
             try:
@@ -266,6 +267,8 @@ def process_video():
             subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio_path)], capture_output=True, text=True, timeout=1800)
             if audio_path.stat().st_size == 0: return jsonify(error="ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။"), 400
             
+            # Groq API ကို သုံးပြီး အသံဖတ်ခြင်း (Whisper)
+            groq_client = Groq(api_key=groq_key)
             with open(audio_path, "rb") as audio_file:
                 transcription = groq_client.audio.transcriptions.create(file=(audio_path.name, audio_file.read()), model="whisper-large-v3", language="zh", response_format="verbose_json", timestamp_granularities=["word", "segment"])
                 
@@ -313,14 +316,18 @@ def process_video():
                 if raw_segments[index]["end"] > raw_segments[index + 1]["start"]:
                     raw_segments[index]["end"] = max(raw_segments[index]["start"] + 0.15, raw_segments[index + 1]["start"])
 
-        # Translate with Groq LLM (Llama 3)
+        # OpenRouter API ကို သုံးပြီး ဘာသာပြန်ခြင်း (OpenAI Compatible)
+        openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openrouter_key
+        )
         translated_lines = []
         for start_index in range(0, len(raw_segments), API_BATCH_SIZE):
             batch = raw_segments[start_index:start_index + API_BATCH_SIZE]
-            try: translated_lines.extend(translate_batch(groq_client, batch))
+            try: translated_lines.extend(translate_batch(openrouter_client, batch))
             except Exception as e: 
                 app.logger.error(f"Translation error: {e}")
-                return jsonify(error="မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ (Groq LLM API Error)"), 502
+                return jsonify(error="မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ (OpenRouter API Error)"), 502
 
         items = []
         for index, segment in enumerate(raw_segments):
