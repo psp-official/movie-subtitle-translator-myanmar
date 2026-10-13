@@ -1,798 +1,807 @@
-
 <!DOCTYPE html>
 <html lang="my">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0b1020">
     <title>Movie Subtitle AI</title>
-    <style>
-        :root {
-            color-scheme: dark;
-            --bg: #090d18;
-            --panel: #111827;
-            --panel2: #172033;
-            --border: #29354b;
-            --text: #edf2ff;
-            --muted: #9ba9c2;
-            --accent: #7c5cff;
-            --accent2: #4b8cff;
-            --green: #29d391;
-            --red: #ff697d;
-        }
 
-        * { box-sizing: border-box; }
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
         body {
             margin: 0;
-            font-family: system-ui, -apple-system, "Noto Sans Myanmar",
-                "Myanmar Text", sans-serif;
-            color: var(--text);
-            background:
-                radial-gradient(ellipse at top, #1b2040 0%, transparent 48%),
-                var(--bg);
-            min-height: 100vh;
+            padding: 20px 14px;
+            background: #0b1020;
+            color: #f4f5ff;
+            font-family: Arial, sans-serif;
         }
 
-        .container {
-            width: min(960px, 100%);
+        main {
+            max-width: 900px;
             margin: auto;
-            padding: 28px 16px 48px;
-        }
-
-        header {
-            text-align: center;
-            margin-bottom: 26px;
-        }
-
-        .logo {
-            width: 62px;
-            height: 62px;
-            display: grid;
-            place-items: center;
-            margin: 0 auto 14px;
-            border-radius: 20px;
-            background: linear-gradient(135deg, var(--accent), var(--accent2));
-            font-size: 28px;
-            box-shadow: 0 8px 35px #6d54ff35;
         }
 
         h1 {
-            font-size: clamp(25px, 5vw, 36px);
-            margin: 0 0 8px;
-            letter-spacing: -.5px;
+            text-align: center;
+            color: #b2a7ff;
+            font-size: 30px;
         }
 
-        header p {
-            color: var(--muted);
-            margin: 0;
-            font-size: 14px;
-            line-height: 1.8;
+        h2 {
+            font-size: 21px;
+        }
+
+        .description {
+            text-align: center;
+            color: #aeb8d0;
+            line-height: 1.9;
         }
 
         .panel {
-            background: #111827ed;
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            padding: 22px;
-            margin-bottom: 18px;
-            box-shadow: 0 12px 45px #00000017;
-        }
-
-        .section-title {
-            font-size: 16px;
-            font-weight: 700;
-            margin: 0 0 16px;
-        }
-
-        .dropzone {
-            display: block;
-            border: 1.5px dashed #53617e;
-            background: #0c1322;
-            border-radius: 15px;
-            padding: 30px 16px;
-            text-align: center;
-            cursor: pointer;
-            transition: .2s;
-        }
-
-        .dropzone:hover, .dropzone.dragover {
-            border-color: var(--accent);
-            background: #171630;
-        }
-
-        .upload-icon { font-size: 35px; margin-bottom: 8px; }
-
-        .dropzone strong {
-            display: block;
-            margin-bottom: 7px;
-            font-size: 15px;
-        }
-
-        .dropzone span {
-            color: var(--muted);
-            font-size: 12px;
-            overflow-wrap: anywhere;
-        }
-
-        input[type="file"] { display: none; }
-
-        .video-preview {
-            width: 100%;
-            max-height: 360px;
-            background: #000;
-            border-radius: 12px;
-            margin-top: 14px;
-            display: none;
-        }
-
-        .settings {
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 16px;
             margin-top: 22px;
+            padding: 20px;
+            border: 1px solid #303b59;
+            border-radius: 16px;
+            background: #151d32;
         }
 
-        .field label {
+        label {
             display: block;
-            color: #c9d4e9;
-            font-size: 13px;
-            font-weight: 600;
-            margin-bottom: 9px;
+            margin-bottom: 10px;
+            font-weight: bold;
         }
 
-        select, input[type="number"] {
+        input[type="file"],
+        select,
+        .time,
+        .subtitle-text {
             width: 100%;
-            min-height: 45px;
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 10px 12px;
-            background: #0b1220;
-            color: var(--text);
+            margin-top: 8px;
+            padding: 12px;
+            border: 1px solid #35415e;
+            border-radius: 9px;
+            background: #0b1020;
+            color: white;
             font: inherit;
-            outline: none;
         }
 
-        select:focus, input:focus {
-            border-color: var(--accent);
+        input[type="file"] {
+            border-style: dashed;
+            border-color: #7771cc;
         }
 
-        .hint {
-            color: var(--muted);
-            font-size: 12px;
-            line-height: 1.7;
-            margin-top: 7px;
-        }
-
-        .primary, .secondary {
+        button {
+            padding: 12px 16px;
             border: 0;
-            border-radius: 11px;
-            padding: 13px 17px;
-            font: inherit;
-            font-weight: 700;
+            border-radius: 9px;
+            background: #7968f5;
+            color: white;
+            font-weight: bold;
             cursor: pointer;
-            transition: opacity .2s, transform .2s;
-        }
-
-        .primary {
-            width: 100%;
-            color: white;
-            margin-top: 22px;
-            background: linear-gradient(100deg, var(--accent), var(--accent2));
-        }
-
-        .secondary {
-            color: white;
-            background: var(--panel2);
-            border: 1px solid var(--border);
-        }
-
-        .primary:hover, .secondary:hover {
-            opacity: .9;
-            transform: translateY(-1px);
         }
 
         button:disabled {
-            opacity: .45;
-            cursor: not-allowed;
-            transform: none;
+            opacity: 0.55;
+            cursor: wait;
         }
 
-        .status {
-            display: none;
-            padding: 14px;
-            border: 1px solid var(--border);
-            background: #0b1220;
-            border-radius: 12px;
-            margin-top: 18px;
+        button.secondary {
+            background: #34415e;
         }
 
-        .status-row {
+        .actions {
             display: flex;
-            justify-content: space-between;
+            flex-wrap: wrap;
             gap: 10px;
+            margin-top: 15px;
+        }
+
+        .muted {
+            color: #aeb8d0;
             font-size: 13px;
-            margin-bottom: 10px;
+            line-height: 1.8;
         }
 
-        .status-text { color: #c5d0e5; }
-
-        .progress-track {
-            height: 7px;
-            border-radius: 99px;
-            overflow: hidden;
-            background: #273249;
-        }
-
-        .progress-bar {
-            height: 100%;
-            width: 0%;
-            border-radius: inherit;
-            background: linear-gradient(90deg, var(--accent), var(--green));
-            transition: width .3s;
-        }
-
-        .notice {
-            display: none;
-            padding: 13px 15px;
-            border-radius: 11px;
-            margin-top: 14px;
-            font-size: 13px;
+        #status {
+            margin-top: 15px;
             line-height: 1.8;
             overflow-wrap: anywhere;
+            white-space: pre-wrap;
         }
 
-        .notice.success {
-            display: block;
-            color: #a5f5d3;
-            background: #103328;
-            border: 1px solid #245c48;
+        .subtitle {
+            padding: 16px 0;
+            border-top: 1px solid #303b59;
         }
 
-        .notice.error {
-            display: block;
-            color: #ffc0c9;
-            background: #391b27;
-            border: 1px solid #713143;
-        }
-
-        .result-header {
+        .subtitle-heading {
             display: flex;
-            align-items: center;
             justify-content: space-between;
             gap: 12px;
-            flex-wrap: wrap;
-            margin-bottom: 16px;
-        }
-
-        .result-header .section-title { margin: 0; }
-
-        .count {
-            display: inline-block;
-            font-size: 12px;
-            color: #d2c9ff;
-            background: #33285d;
-            padding: 5px 9px;
-            border-radius: 8px;
-            margin-left: 5px;
-        }
-
-        .subtitle-list {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            max-height: 560px;
-            overflow-y: auto;
-        }
-
-        .subtitle-item {
-            background: #0b1220;
-            border: 1px solid #263249;
-            border-radius: 12px;
-            padding: 13px;
-        }
-
-        .subtitle-meta {
-            display: flex;
             align-items: center;
-            justify-content: space-between;
-            gap: 10px;
-            color: #9cabc6;
-            font-size: 11px;
-            margin-bottom: 9px;
         }
 
-        .subtitle-item textarea {
-            width: 100%;
-            resize: vertical;
-            min-height: 58px;
-            padding: 10px;
-            border: 1px solid transparent;
-            border-radius: 8px;
-            color: #f2f5ff;
-            background: #141e30;
-            font: inherit;
-            line-height: 1.9;
+        .subtitle-heading strong {
+            color: #c7c0ff;
         }
 
-        .subtitle-item textarea:focus {
-            outline: none;
-            border-color: var(--accent);
-        }
-
-        .empty {
-            text-align: center;
-            color: var(--muted);
-            padding: 30px 10px;
+        .time {
             font-size: 13px;
-            line-height: 1.9;
         }
 
-        .result-actions {
-            display: flex;
-            gap: 10px;
-            margin-top: 16px;
+        .subtitle-text {
+            min-height: 78px;
+            resize: vertical;
+            line-height: 1.7;
         }
 
-        .result-actions button { flex: 1; }
+        .source {
+            margin-top: 10px;
+            color: #aeb8d0;
+            font-size: 12px;
+            overflow-wrap: anywhere;
+            line-height: 1.7;
+        }
 
-        footer {
+        .hidden {
+            display: none !important;
+        }
+
+        .notice-error {
+            color: #ff9caa;
+        }
+
+        .notice-success {
+            color: #9ee6bd;
+        }
+
+        .footer {
+            margin: 25px 0;
             text-align: center;
-            color: #75839c;
-            font-size: 11px;
-            line-height: 1.8;
-            padding-top: 10px;
+            color: #8290ad;
+            font-size: 12px;
         }
 
-        @media (max-width: 560px) {
-            .container { padding: 20px 12px 35px; }
-            .panel { padding: 16px; border-radius: 16px; }
-            .settings { grid-template-columns: 1fr; gap: 13px; }
-            .result-actions { flex-direction: column; }
-            .dropzone { padding: 25px 12px; }
+        @media (max-width: 520px) {
+            body {
+                padding: 14px 10px;
+            }
+
+            .panel {
+                padding: 15px;
+            }
+
+            .actions button {
+                flex: 1 1 100%;
+            }
         }
     </style>
 </head>
+
 <body>
-<div class="container">
-    <header>
-        <div class="logo">字幕</div>
-        <h1>Movie Subtitle AI</h1>
-        <p>AI ဖြင့် မြန်မာစာတန်းထိုး ဖန်တီးပါ။<br>
-           Video မှ စာတန်းထုတ်ယူခြင်းနှင့် အသံမှ စာသားပြောင်းခြင်းတို့ကို ပံ့ပိုးသည်။</p>
-    </header>
+<main>
+    <h1>Movie Subtitle AI</h1>
+
+    <p class="description">
+        ဗီဒီယိုမှ မြန်မာစာတန်းထိုး SRT ဖိုင် ထုတ်ယူရန်<br>
+        စာတန်းထိုးကို ပြင်ဆင်၊ Copy လုပ်ပြီး ဒေါင်းလုဒ်လုပ်နိုင်ပါသည်။
+    </p>
 
     <section class="panel">
-        <h2 class="section-title">🎬 Video ထည့်သွင်းရန်</h2>
+        <label for="video">၁။ ဗီဒီယိုဖိုင်ရွေးပါ</label>
 
-        <form id="processForm">
-            <label class="dropzone" id="dropzone" for="videoInput">
-                <div class="upload-icon">📁</div>
-                <strong>Video ဖိုင်ရွေးရန် သို့မဟုတ် ဒီနေရာသို့ ဆွဲထည့်ပါ</strong>
-                <span id="fileName">MP4, MKV, MOV နှင့် အခြား FFmpeg ပံ့ပိုးသော format များ</span>
-            </label>
-            <input type="file" id="videoInput" name="video"
-                   accept="video/*,.mkv,.avi,.mov,.webm,.m4v" required>
+        <input
+            id="video"
+            type="file"
+            accept=".mp4,.mov,.mkv,.webm,.avi"
+        >
 
-            <video id="videoPreview" class="video-preview" controls></video>
+        <p class="muted">
+            ဗီဒီယိုဖိုင်ကြီးလျှင် လုပ်ဆောင်ချိန်ကြာနိုင်ပါသည်။
+        </p>
 
-            <div class="settings">
-                <div class="field">
-                    <label for="mode">စာသားထုတ်ယူမည့်နည်းလမ်း</label>
-                    <select id="mode" name="mode">
-                        <option value="auto">Auto — OCR / Audio</option>
-                        <option value="ocr">OCR — Video ထဲက စာတန်း</option>
-                        <option value="audio">Audio — အသံမှ စာသား</option>
-                    </select>
-                    <div class="hint">
-                        Auto သည် hardcoded subtitle ရှိမရှိ စစ်ဆေးပြီး
-                        လိုအပ်သလို Audio transcription သို့ ပြောင်းသုံးသည်။
-                    </div>
-                </div>
+        <label for="mode">စာတန်းထိုး ထုတ်ယူမည့်နည်းလမ်း</label>
 
-                <div class="field">
-                    <label for="delay">Subtitle Delay (စက္ကန့်)</label>
-                    <input type="number" id="delay" name="delay"
-                           value="0" step="0.1" min="-60" max="60">
-                    <div class="hint">
-                        စာတန်းနောက်ကျလျှင် အပေါင်းတန်ဖိုး၊
-                        စာတန်းစောလျှင် အနုတ်တန်ဖိုး ထည့်ပါ။
-                    </div>
-                </div>
-            </div>
+        <select id="mode">
+            <option value="auto">
+                Auto — ရှိပြီးသားစာတန်းကို ဦးစားပေး
+            </option>
 
-            <button type="submit" class="primary" id="processBtn">
-                ✨ မြန်မာစာတန်းထိုး စတင်ဖန်တီးမည်
+            <option value="audio">
+                Audio — အသံထဲက စကားပြောကို ဖတ်ယူ
+            </option>
+
+            <option value="ocr">
+                OCR — ဗီဒီယိုပေါ်က စာတန်းကို ဖတ်ယူ
+            </option>
+        </select>
+
+        <p class="muted">
+            ဇာတ်ကောင်တွေရဲ့ တကယ့်စကားပြောကို စာတန်းထိုးလိုပါက
+            Audio ကိုရွေးပါ။ ဗီဒီယိုပေါ်က စာတန်းကို ဖတ်လိုပါက
+            OCR ကိုရွေးပါ။
+        </p>
+
+        <div class="actions">
+            <button id="process" type="button">
+                ဘာသာပြန်မယ်
             </button>
-        </form>
 
-        <div class="status" id="statusBox" aria-live="polite">
-            <div class="status-row">
-                <span class="status-text" id="statusText">ပြင်ဆင်နေသည်...</span>
-                <span id="progressText">0%</span>
-            </div>
-            <div class="progress-track">
-                <div class="progress-bar" id="progressBar"></div>
-            </div>
-            <div class="hint" id="statusHint">
-                Video အရွယ်အစားနှင့် API တုံ့ပြန်မှုအပေါ် မူတည်ပြီး အချိန်ကြာနိုင်သည်။
-            </div>
+            <button id="openSrt" class="secondary" type="button">
+                ရှိပြီးသား SRT ဖွင့်မယ်
+            </button>
+
+            <input
+                id="srtFile"
+                type="file"
+                accept=".srt,.txt"
+                class="hidden"
+            >
         </div>
 
-        <div class="notice" id="notice" role="status"></div>
+        <div id="status" role="status" aria-live="polite"></div>
     </section>
 
-    <section class="panel" id="resultsPanel">
-        <div class="result-header">
-            <h2 class="section-title">
-                📝 မြန်မာစာတန်းထိုးရလဒ်
-                <span class="count" id="subtitleCount">0</span>
-            </h2>
-        </div>
+    <section id="editor" class="panel hidden">
+        <h2>၂။ စာတန်းထိုး ပြင်ဆင်ရန်</h2>
 
-        <div id="subtitleList" class="subtitle-list">
-            <div class="empty">
-                လုပ်ဆောင်ပြီးသော စာတန်းများ ဒီနေရာတွင် ပေါ်လာပါမည်။<br>
-                Video တစ်ခုကို ရွေးပြီး စတင်ပါ။
-            </div>
-        </div>
+        <p id="count" class="muted"></p>
 
-        <div class="result-actions">
-            <button type="button" class="secondary" id="copyBtn" disabled>
-                📋 စာသားအားလုံး Copy
+        <div id="subtitleList"></div>
+
+        <div class="actions">
+            <button id="download" type="button">
+                SRT ဖိုင်ဒေါင်းလုဒ်
             </button>
-            <button type="button" class="primary" id="exportBtn" disabled
-                    style="margin-top:0">
-                ⬇ SRT ဖိုင် Export
+
+            <button id="copy" class="secondary" type="button">
+                SRT အပြည့်အစုံ Copy
             </button>
         </div>
     </section>
 
-    <footer>
-        Movie Subtitle AI · OCR + Speech Recognition + AI Translation<br>
-        API အသုံးပြုမှုနှင့် ကန့်သတ်ချက်များသည် သက်ဆိုင်ရာ API provider များအပေါ် မူတည်သည်။
+    <footer class="footer">
+        Movie Subtitle AI
     </footer>
-</div>
+</main>
 
 <script>
-(() => {
-    "use strict";
+"use strict";
 
-    const form = document.getElementById("processForm");
-    const videoInput = document.getElementById("videoInput");
-    const dropzone = document.getElementById("dropzone");
-    const fileName = document.getElementById("fileName");
-    const videoPreview = document.getElementById("videoPreview");
-    const processBtn = document.getElementById("processBtn");
-    const statusBox = document.getElementById("statusBox");
-    const statusText = document.getElementById("statusText");
-    const statusHint = document.getElementById("statusHint");
-    const progressText = document.getElementById("progressText");
-    const progressBar = document.getElementById("progressBar");
-    const notice = document.getElementById("notice");
-    const subtitleList = document.getElementById("subtitleList");
-    const subtitleCount = document.getElementById("subtitleCount");
-    const copyBtn = document.getElementById("copyBtn");
-    const exportBtn = document.getElementById("exportBtn");
+const $ = id => document.getElementById(id);
 
-    let subtitles = [];
-    let previewUrl = null;
-    let requestController = null;
+let subtitles = [];
 
-    function showNotice(message, type) {
-        notice.className = "notice " + type;
-        notice.textContent = message;
+
+/* =========================
+   STATUS MESSAGE
+========================= */
+
+function setStatus(message, kind = "") {
+    const status = $("status");
+
+    status.textContent = message || "";
+    status.className = kind ? `notice-${kind}` : "";
+}
+
+
+/* =========================
+   TIMESTAMP CONVERSION
+========================= */
+
+function clockToSeconds(value) {
+    const match = String(value || "").trim().match(
+        /^(\d+):([0-5]\d):([0-5]\d)[,.](\d{1,3})$/
+    );
+
+    if (!match) {
+        return null;
     }
 
-    function hideNotice() {
-        notice.className = "notice";
-        notice.textContent = "";
+    const hours = Number(match[1]);
+    const minutes = Number(match[2]);
+    const seconds = Number(match[3]);
+    const milliseconds = Number(
+        match[4].padEnd(3, "0")
+    );
+
+    return (
+        hours * 3600 +
+        minutes * 60 +
+        seconds +
+        milliseconds / 1000
+    );
+}
+
+
+function secondsToClock(value) {
+    let seconds = Number(value);
+
+    if (!Number.isFinite(seconds) || seconds < 0) {
+        seconds = 0;
     }
 
-    function setProgress(percent, message) {
-        const value = Math.max(0, Math.min(100, percent));
-        progressBar.style.width = value + "%";
-        progressText.textContent = Math.round(value) + "%";
-        if (message) statusText.textContent = message;
-    }
+    const totalMs = Math.round(seconds * 1000);
 
-    function setBusy(busy) {
-        processBtn.disabled = busy;
-        videoInput.disabled = busy;
-        document.getElementById("mode").disabled = busy;
-        document.getElementById("delay").disabled = busy;
-        processBtn.textContent = busy
-            ? "⏳ လုပ်ဆောင်နေသည်..."
-            : "✨ မြန်မာစာတန်းထိုး စတင်ဖန်တီးမည်";
-    }
+    const hours = Math.floor(totalMs / 3600000);
 
-    function selectFile(file) {
-        if (!file) return;
+    const minutes = Math.floor(
+        (totalMs % 3600000) / 60000
+    );
 
-        const allowed = /\.(mp4|mkv|mov|avi|webm|m4v|mpeg|mpg)$/i;
-        if (file.type && !file.type.startsWith("video/") && !allowed.test(file.name)) {
-            showNotice("Video ဖိုင်တစ်ခုကိုသာ ရွေးချယ်ပါ။", "error");
-            return;
-        }
+    const secs = Math.floor(
+        (totalMs % 60000) / 1000
+    );
 
-        const transfer = new DataTransfer();
-        transfer.items.add(file);
-        videoInput.files = transfer.files;
+    const milliseconds = totalMs % 1000;
 
-        fileName.textContent = file.name + " · " + formatBytes(file.size);
+    return (
+        String(hours).padStart(2, "0") + ":" +
+        String(minutes).padStart(2, "0") + ":" +
+        String(secs).padStart(2, "0") + "," +
+        String(milliseconds).padStart(3, "0")
+    );
+}
 
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        previewUrl = URL.createObjectURL(file);
-        videoPreview.src = previewUrl;
-        videoPreview.style.display = "block";
 
-        hideNotice();
-    }
+/* =========================
+   NORMALIZE SUBTITLES
+========================= */
 
-    function formatBytes(bytes) {
-        if (!Number.isFinite(bytes)) return "";
-        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-        return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-    }
+function normalizeSubtitle(item, index) {
+    const rawTime = String(
+        item.time || item.timestamp || ""
+    );
 
-    videoInput.addEventListener("change", () => {
-        selectFile(videoInput.files[0]);
-    });
+    const timeParts = rawTime.split(/\s*-->\s*/);
 
-    ["dragenter", "dragover"].forEach(eventName => {
-        dropzone.addEventListener(eventName, event => {
-            event.preventDefault();
-            dropzone.classList.add("dragover");
+    const parsedStart = clockToSeconds(timeParts[0]);
+    const parsedEnd = clockToSeconds(timeParts[1]);
+
+    const rawStart =
+        item.start ??
+        item.start_time ??
+        item.begin;
+
+    const rawEnd =
+        item.end ??
+        item.end_time ??
+        item.finish;
+
+    const startCandidate =
+        rawStart != null
+            ? Number(rawStart)
+            : parsedStart;
+
+    const endCandidate =
+        rawEnd != null
+            ? Number(rawEnd)
+            : parsedEnd;
+
+    const start = Number.isFinite(startCandidate)
+        ? Math.max(0, startCandidate)
+        : 0;
+
+    const end = Number.isFinite(endCandidate)
+        ? Math.max(start + 0.15, endCandidate)
+        : start + 2;
+
+    return {
+        index: index + 1,
+        start,
+        end,
+
+        time:
+            secondsToClock(start) +
+            " --> " +
+            secondsToClock(end),
+
+        text: String(
+            item.text ??
+            item.translation ??
+            item.subtitle ??
+            ""
+        ).trim(),
+
+        source: String(item.source ?? "").trim()
+    };
+}
+
+
+/* =========================
+   RENDER SUBTITLES
+========================= */
+
+function renderSubtitles() {
+    $("editor").classList.remove("hidden");
+
+    $("count").textContent =
+        `စုစုပေါင်း ${subtitles.length} ကြောင်း`;
+
+    const container = $("subtitleList");
+
+    container.replaceChildren();
+
+    subtitles.forEach((item, index) => {
+        const block = document.createElement("div");
+        block.className = "subtitle";
+
+        const heading = document.createElement("div");
+        heading.className = "subtitle-heading";
+
+        const title = document.createElement("strong");
+        title.textContent = `စာတန်း ${index + 1}`;
+
+        heading.appendChild(title);
+
+        const time = document.createElement("input");
+
+        time.className = "time";
+        time.type = "text";
+        time.value = item.time || "";
+
+        time.placeholder =
+            "00:00:00,000 --> 00:00:02,000";
+
+        time.setAttribute(
+            "aria-label",
+            `စာတန်း ${index + 1} အချိန်`
+        );
+
+        time.addEventListener("input", () => {
+            subtitles[index].time = time.value.trim();
         });
-    });
 
-    ["dragleave", "drop"].forEach(eventName => {
-        dropzone.addEventListener(eventName, event => {
-            event.preventDefault();
-            dropzone.classList.remove("dragover");
+        const source = document.createElement("div");
+
+        source.className = "source";
+
+        source.textContent =
+            "မူရင်းစာသား: " +
+            (item.source || "မရှိပါ");
+
+        const text = document.createElement("textarea");
+
+        text.className = "subtitle-text";
+        text.value = item.text || "";
+
+        text.setAttribute(
+            "aria-label",
+            `စာတန်း ${index + 1} မြန်မာစာ`
+        );
+
+        text.addEventListener("input", () => {
+            subtitles[index].text = text.value;
         });
-    });
 
-    dropzone.addEventListener("drop", event => {
-        const file = event.dataTransfer.files[0];
-        selectFile(file);
-    });
-
-    function normalizeSubtitle(item, index) {
-        const start = Number(
-            item.start ?? item.start_time ?? item.begin ?? 0
-        );
-        const end = Number(
-            item.end ?? item.end_time ?? item.finish ?? start + 2
+        block.append(
+            heading,
+            time,
+            source,
+            text
         );
 
-        return {
-            index: index + 1,
-            start: Number.isFinite(start) ? Math.max(0, start) : 0,
-            end: Number.isFinite(end) ? Math.max(start, end) : start + 2,
-            text: String(item.text ?? item.translation ?? item.subtitle ?? "")
-        };
-    }
+        container.appendChild(block);
+    });
+}
 
-    function secondsToClock(seconds) {
-        const safe = Math.max(0, Number(seconds) || 0);
-        const totalMs = Math.round(safe * 1000);
-        const hours = Math.floor(totalMs / 3600000);
-        const minutes = Math.floor((totalMs % 3600000) / 60000);
-        const secs = Math.floor((totalMs % 60000) / 1000);
-        const ms = totalMs % 1000;
 
-        return String(hours).padStart(2, "0") + ":" +
-            String(minutes).padStart(2, "0") + ":" +
-            String(secs).padStart(2, "0") + "," +
-            String(ms).padStart(3, "0");
-    }
+/* =========================
+   CREATE SRT TEXT
+========================= */
 
-    function escapeHtml(value) {
-        return String(value).replace(/[&<>"']/g, char => ({
-            "&": "&amp;",
-            "<": "&lt;",
-            ">": "&gt;",
-            '"': "&quot;",
-            "'": "&#39;"
-        })[char]);
-    }
+function makeSrt() {
+    const blocks = [];
 
-    function renderSubtitles() {
-        subtitleCount.textContent = subtitles.length;
-        const hasItems = subtitles.length > 0;
-        copyBtn.disabled = !hasItems;
-        exportBtn.disabled = !hasItems;
+    subtitles.forEach(item => {
+        const text = String(item.text || "").trim();
+        const time = String(item.time || "").trim();
 
-        if (!hasItems) {
-            subtitleList.innerHTML =
-                '<div class="empty">စာတန်းထိုးရလဒ် မရှိသေးပါ။</div>';
+        if (!text || !time.includes("-->")) {
             return;
         }
 
-        subtitleList.innerHTML = subtitles.map((item, index) => `
-            <div class="subtitle-item" data-index="${index}">
-                <div class="subtitle-meta">
-                    <span>#${index + 1}</span>
-                    <span>${secondsToClock(item.start)} → ${secondsToClock(item.end)}</span>
-                </div>
-                <textarea aria-label="Subtitle ${index + 1}"
-                    data-edit-index="${index}" rows="2"
-                    spellcheck="false">${escapeHtml(item.text)}</textarea>
-            </div>
-        `).join("");
-    }
+        const parts = time.split(/\s*-->\s*/);
 
-    subtitleList.addEventListener("input", event => {
-        const index = Number(event.target.dataset.editIndex);
-        if (Number.isInteger(index) && subtitles[index]) {
-            subtitles[index].text = event.target.value;
-        }
-    });
-
-    async function readResponse(response) {
-        const contentType = response.headers.get("content-type") || "";
-
-        if (contentType.includes("application/json")) {
-            return await response.json();
-        }
-
-        const raw = await response.text();
-        throw new Error(
-            raw.slice(0, 500) ||
-            "Server မှ မမျှော်လင့်ထားသော တုံ့ပြန်မှု ရရှိခဲ့သည်။"
-        );
-    }
-
-    form.addEventListener("submit", async event => {
-        event.preventDefault();
-        hideNotice();
-
-        const file = videoInput.files[0];
-        if (!file) {
-            showNotice("ပထမဦးစွာ Video ဖိုင်ကို ရွေးချယ်ပါ။", "error");
+        if (parts.length !== 2) {
             return;
         }
 
-        if (requestController) requestController.abort();
-        requestController = new AbortController();
+        const start = clockToSeconds(parts[0]);
+        const end = clockToSeconds(parts[1]);
 
-        const data = new FormData();
-        data.append("video", file);
-        data.append("mode", document.getElementById("mode").value);
-        data.append("delay", document.getElementById("delay").value || "0");
+        if (start === null || end === null || end <= start) {
+            return;
+        }
 
-        subtitles = [];
+        blocks.push(
+            `${blocks.length + 1}\n` +
+            `${parts[0].trim()} --> ${parts[1].trim()}\n` +
+            `${text}`
+        );
+    });
+
+    return blocks.length
+        ? blocks.join("\n\n") + "\n"
+        : "";
+}
+
+
+/* =========================
+   READ SERVER RESPONSE
+========================= */
+
+async function readResponse(response) {
+    const contentType =
+        response.headers.get("content-type") || "";
+
+    if (contentType.includes("application/json")) {
+        return await response.json();
+    }
+
+    const text = await response.text();
+
+    throw new Error(
+        text.slice(0, 500) ||
+        `Server error (${response.status})`
+    );
+}
+
+
+/* =========================
+   PROCESS VIDEO
+========================= */
+
+$("process").addEventListener("click", async () => {
+    const file = $("video").files[0];
+
+    if (!file) {
+        setStatus(
+            "ဗီဒီယိုဖိုင်ကို အရင်ရွေးပေးပါ။",
+            "error"
+        );
+
+        return;
+    }
+
+    $("process").disabled = true;
+
+    $("editor").classList.add("hidden");
+
+    setStatus(
+        "လုပ်ဆောင်နေပါပြီ။ ဗီဒီယိုကြာချိန်နှင့် ဖိုင်အရွယ်အစားပေါ်မူတည်ပြီး စောင့်ရနိုင်ပါတယ်။"
+    );
+
+    try {
+        const form = new FormData();
+
+        form.append("video", file);
+        form.append("mode", $("mode").value);
+
+        const response = await fetch("/api/process", {
+            method: "POST",
+            body: form
+        });
+
+        const data = await readResponse(response);
+
+        if (!response.ok) {
+            throw new Error(
+                data.error ||
+                data.message ||
+                "ဘာသာပြန်မအောင်မြင်ပါ။"
+            );
+        }
+
+        const items = Array.isArray(data.items)
+            ? data.items
+            : [];
+
+        subtitles = items.map(normalizeSubtitle);
+
+        if (!subtitles.length) {
+            throw new Error(
+                data.error ||
+                "စာတန်းထိုး မတွေ့ပါ။ Audio သို့မဟုတ် OCR mode ကို ပြောင်းပြီး ထပ်စမ်းကြည့်ပါ။"
+            );
+        }
+
         renderSubtitles();
-        setBusy(true);
-        statusBox.style.display = "block";
-        setProgress(5, "Video ကို Server သို့ ပို့နေသည်...");
-        statusHint.textContent =
-            "Upload နှင့် AI processing ကြာချိန်သည် Video အရွယ်အစားအပေါ် မူတည်သည်။";
 
-        // This is an estimated progress indicator. The API does not expose
-        // actual processing progress unless the backend adds a progress endpoint.
-        let estimated = 5;
-        const progressTimer = setInterval(() => {
-            if (estimated < 88) {
-                estimated += estimated < 35 ? 4 : estimated < 65 ? 1.5 : 0.4;
-                setProgress(estimated,
-                    estimated < 30 ? "Video ကို ပို့နေသည်..." :
-                    estimated < 55 ? "စာသားထုတ်ယူနေသည်..." :
-                    estimated < 80 ? "AI ဖြင့် မြန်မာဘာသာပြန်နေသည်..." :
-                    "ရလဒ်ကို ပြင်ဆင်နေသည်...");
-            }
-        }, 1200);
+        setStatus(
+            data.notice ||
+            `ပြီးပါပြီ။ စာတန်း ${subtitles.length} ကြောင်း ရရှိပါပြီ။`,
+            "success"
+        );
 
-        try {
-            const response = await fetch("/api/process", {
-                method: "POST",
-                body: data,
-                signal: requestController.signal
-            });
+    } catch (error) {
+        setStatus(
+            error.message ||
+            "ချိတ်ဆက်မှု မအောင်မြင်ပါ။ ခဏစောင့်ပြီး ထပ်ကြိုးစားပါ။",
+            "error"
+        );
 
-            const result = await readResponse(response);
+    } finally {
+        $("process").disabled = false;
+    }
+});
 
-            if (!response.ok || result.error) {
-                throw new Error(result.error || "လုပ်ဆောင်မှု မအောင်မြင်ပါ။");
-            }
 
-            if (!Array.isArray(result.items)) {
-                throw new Error("Server response ထဲတွင် items array မပါဝင်ပါ။");
-            }
+/* =========================
+   DOWNLOAD SRT
+========================= */
 
-            subtitles = result.items.map(normalizeSubtitle);
-            renderSubtitles();
-            setProgress(100, "ပြီးဆုံးပါပြီ။");
+$("download").addEventListener("click", () => {
+    const content = makeSrt();
 
-            const message = result.notice
-                ? String(result.notice)
-                : "မြန်မာစာတန်းထိုး ဖန်တီးမှု ပြီးဆုံးပါပြီ။";
+    if (!content.trim()) {
+        setStatus(
+            "ဒေါင်းလုဒ်လုပ်ရန် မှန်ကန်သော အချိန်နဲ့ စာတန်းစာသား မရှိသေးပါ။",
+            "error"
+        );
 
-            showNotice(
-                message + " စာတန်းများကို လိုအပ်သလို ပြင်ဆင်ပြီး SRT Export လုပ်နိုင်ပါသည်။",
-                "success"
+        return;
+    }
+
+    const blob = new Blob(
+        ["\uFEFF" + content],
+        {
+            type: "application/x-subrip;charset=utf-8"
+        }
+    );
+
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = "myanmar_subtitles.srt";
+
+    document.body.appendChild(link);
+
+    link.click();
+    link.remove();
+
+    setTimeout(() => {
+        URL.revokeObjectURL(url);
+    }, 1000);
+
+    setStatus(
+        "SRT ဖိုင်ကို ဒေါင်းလုဒ်လုပ်ပြီးပါပြီ။",
+        "success"
+    );
+});
+
+
+/* =========================
+   COPY COMPLETE SRT
+========================= */
+
+$("copy").addEventListener("click", async () => {
+    const content = makeSrt();
+
+    if (!content.trim()) {
+        setStatus(
+            "Copy လုပ်ရန် စာတန်း မရှိသေးပါ။",
+            "error"
+        );
+
+        return;
+    }
+
+    try {
+        await navigator.clipboard.writeText(content);
+
+        setStatus(
+            "SRT အပြည့်အစုံကို Copy လုပ်ပြီးပါပြီ။",
+            "success"
+        );
+
+    } catch (error) {
+        const textarea = document.createElement("textarea");
+
+        textarea.value = content;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+
+        document.body.appendChild(textarea);
+
+        textarea.select();
+
+        const success = document.execCommand("copy");
+
+        textarea.remove();
+
+        setStatus(
+            success
+                ? "SRT အပြည့်အစုံကို Copy လုပ်ပြီးပါပြီ။"
+                : "Copy မအောင်မြင်ပါ။ SRT ဖိုင်ကို ဒေါင်းလုဒ်လုပ်ပါ။",
+
+            success ? "success" : "error"
+        );
+    }
+});
+
+
+/* =========================
+   OPEN EXISTING SRT
+========================= */
+
+$("openSrt").addEventListener("click", () => {
+    $("srtFile").click();
+});
+
+
+$("srtFile").addEventListener("change", async () => {
+    const file = $("srtFile").files[0];
+
+    if (!file) {
+        return;
+    }
+
+    try {
+        const content = (
+            await file.text()
+        ).replace(/^\uFEFF/, "").trim();
+
+        const blocks = content.split(/\r?\n\s*\r?\n/);
+
+        const parsed = [];
+
+        for (const block of blocks) {
+            const lines = block.split(/\r?\n/);
+
+            const timeIndex = lines.findIndex(
+                line => line.includes("-->")
             );
 
-        } catch (error) {
-            if (error.name === "AbortError") {
-                showNotice("တောင်းဆိုမှုကို ရပ်တန့်လိုက်ပါသည်။", "error");
-            } else {
-                showNotice(
-                    "Error: " + (error.message || "မသိရှိသော အမှားတစ်ခု ဖြစ်ပွားခဲ့သည်။"),
-                    "error"
-                );
+            if (
+                timeIndex < 0 ||
+                timeIndex === lines.length - 1
+            ) {
+                continue;
             }
-            setProgress(0, "လုပ်ဆောင်မှု မအောင်မြင်ပါ။");
-        } finally {
-            clearInterval(progressTimer);
-            setBusy(false);
-            requestController = null;
+
+            parsed.push({
+                time: lines[timeIndex].trim(),
+
+                text: lines
+                    .slice(timeIndex + 1)
+                    .join("\n")
+                    .trim(),
+
+                source: ""
+            });
         }
-    });
 
-    copyBtn.addEventListener("click", async () => {
-        const text = subtitles.map(item => item.text).join("\n");
-        try {
-            await navigator.clipboard.writeText(text);
-            showNotice("စာတန်းအားလုံးကို Copy လုပ်ပြီးပါပြီ။", "success");
-        } catch {
-            const textarea = document.createElement("textarea");
-            textarea.value = text;
-            document.body.appendChild(textarea);
-            textarea.select();
-            const success = document.execCommand("copy");
-            textarea.remove();
+        subtitles = parsed.map(normalizeSubtitle);
 
-            showNotice(
-                success ? "စာတန်းအားလုံးကို Copy လုပ်ပြီးပါပြီ။"
-                        : "Copy မလုပ်နိုင်ပါ။ စာတန်းများကို ကိုယ်တိုင်ရွေးချယ်ပါ။",
-                success ? "success" : "error"
+        if (!subtitles.length) {
+            throw new Error(
+                "မှန်ကန်သော SRT စာတန်း မတွေ့ပါ။"
             );
         }
-    });
 
-    exportBtn.addEventListener("click", async () => {
-        if (!subtitles.length) return;
+        renderSubtitles();
 
-        exportBtn.disabled = true;
-        exportBtn.textContent = "⏳ SRT ပြင်ဆင်နေသည်...";
+        setStatus(
+            `SRT ဖိုင်ကို ဖွင့်ပြီးပါပြီ။ စာတန်း ${subtitles.length} ကြောင်း ရှိပါတယ်။`,
+            "success"
+        );
 
-        try {
-            // Submit edited subtitles so the exported file includes changes.
-            const response = await fetch("/api/export", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ items: subtitles })
-            });
+    } catch (error) {
+        setStatus(
+            error.message || "SRT ဖိုင်ကို ဖွင့်မရပါ။",
+            "error"
+        );
 
-            if (!response.ok) {
-                let message = "SRT Export မအောင်မြင်ပါ။";
-                try {
-                    const result = await response.json();
-                    message = result.error || message;
-                } catch {}
-                throw new Error(message);
-            }
-
-            const blob = await response.blob();
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = "myanmar_subtitles.srt";
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-            URL.revokeObjectURL(url);
-
-            showNotice("SRT ဖိုင်ကို Export လုပ်ပြီးပါပြီ။", "success");
-        } catch (error) {
-            showNotice(error.message || "SRT Export မအောင်မြင်ပါ။", "error");
-        } finally {
-            exportBtn.disabled = subtitles.length === 0;
-            exportBtn.textContent = "⬇ SRT ဖိုင် Export";
-        }
-    });
-})();
+    } finally {
+        $("srtFile").value = "";
+    }
+});
 </script>
 </body>
 </html>
