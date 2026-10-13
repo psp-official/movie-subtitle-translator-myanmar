@@ -19,9 +19,9 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-# OpenRouter တွင် လုံးဝအခမဲ့ဖြစ်ပြီး မြန်မာစာအထောက်အပံ့ကောင်းသော မော်ဒယ်
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-2-9b-it:free")
-API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "25"))))
+# OpenRouter တွင် အခမဲ့ပေးထားသော မော်ဒယ်
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "huggingfaceh4/zephyr-7b-beta:free")
+API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "20"))))
 API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
 TRANSLATION_CACHE_MAX = 5000
@@ -203,7 +203,7 @@ def run_ocr_extraction(video_path):
                 
         frame_count += 1
         
-    if current_text and re.search(r'[\u4e00-\u9fff]', current_text):
+    if current_text and re.search(r'[一-鿿]', current_text):
         segments.append({"start": current_start, "end": frame_count / fps, "text": current_text})
         
     cap.release()
