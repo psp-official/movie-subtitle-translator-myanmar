@@ -26,7 +26,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
 GEMINI_BATCH_SIZE = max(1, min(30, int(os.getenv("GEMINI_BATCH_SIZE", "20"))))
 GEMINI_RETRIES = max(0, min(5, int(os.getenv("GEMINI_RETRIES", "3"))))
