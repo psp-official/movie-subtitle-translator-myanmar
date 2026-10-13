@@ -76,19 +76,7 @@ def _cache_put(key, value):
     while len(TRANSLATION_CACHE) > TRANSLATION_CACHE_MAX: TRANSLATION_CACHE.popitem(last=False)
 
 def check_openrouter_model(model_name):
-    # အကယ်၍ မော်ဒယ်က Down နေရင် အခြားအခမဲ့မော်ဒယ်တစ်ခုကို ပြောင်းသုံးပါမယ်
-    fallback_models = [
-        "google/gemini-2.0-pro-exp-0205:free",
-        "google/gemini-2.0-flash-lite-preview-02-05:free",
-        "mistralai/mistral-nemo:free",
-        "nvidia/llama-3.1-nemotron-70b-instruct:free",
-        "qwen/qwen-2-7b-instruct:free",
-        "meta-llama/llama-3.2-3b-instruct:free"
-    ]
-    
-    # ရွေးထားတဲ့ မော်ဒယ်ကို အရင်စစ်ကြည့်ပါမယ်။ 
-    current_model = model_name
-    return current_model # Temporarily disabled strict checking to avoid API key block during startup
+    return model_name
 
 def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
     translations = {}
@@ -107,19 +95,19 @@ def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
         fallback_models = [
             "google/gemini-2.0-pro-exp-0205:free",
             "google/gemini-2.0-flash-lite-preview-02-05:free",
-            "mistralai/mistral-nemo:free",
             "nvidia/llama-3.1-nemotron-70b-instruct:free",
             "qwen/qwen-2-7b-instruct:free",
-            "meta-llama/llama-3.2-3b-instruct:free"
+            "meta-llama/llama-3.2-3b-instruct:free",
+            "mistralai/mistral-nemo:free",
+            "google/gemma-2-9b-it:free"
         ]
 
-        for attempt in range(API_RETRIES + 1):
+        current_model_idx = -1
+        retry_count = 0
+        max_total_attempts = len(fallback_models) + API_RETRIES + 2
+
+        for attempt in range(max_total_attempts):
             try:
-                # 404 Error တက်ရင် မော်ဒယ်အသစ်ပြောင်းဖို့ အလှည့်ကျစစ်ဆေးပါတယ်
-                if attempt > 0 and attempt <= len(fallback_models):
-                    current_model = fallback_models[attempt - 1]
-                    app.logger.warning(f"Retrying with fallback model: {current_model}")
-                    
                 response = client.chat.completions.create(
                     model=current_model,
                     messages=[
@@ -131,15 +119,22 @@ def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
                 break
             except Exception as exc:
                 err_msg = str(exc)
-                if "404" in err_msg or "unavailable" in err_msg.lower() or "no endpoints found" in err_msg.lower():
-                    # 404 error ဖြစ်ရင် ချက်ချင်းနောက်တစ်ခုပြောင်းစမ်းပါမယ်
-                    app.logger.warning(f"Model {current_model} unavailable (404). Switching model...")
-                    if attempt >= API_RETRIES and attempt >= len(fallback_models): 
-                        raise
+                if "404" in err_msg or "unavailable" in err_msg.lower() or "no endpoints found" in err_msg.lower() or "not a valid model" in err_msg.lower():
+                    # 404 Error: Switch to the next model immediately
+                    app.logger.warning(f"Model {current_model} unavailable. Switching model...")
+                    current_model_idx += 1
+                    if current_model_idx >= len(fallback_models):
+                        raise Exception("All fallback models are currently unavailable on OpenRouter.")
+                    current_model = fallback_models[current_model_idx]
+                    app.logger.warning(f"Retrying with fallback model: {current_model}")
                     continue
                 else:
-                    if attempt >= API_RETRIES: raise
-                    time.sleep(min(30, 2 ** attempt * 2))
+                    # Other Error (e.g. rate limit 429, API timeout 502)
+                    retry_count += 1
+                    app.logger.warning(f"API Error ({err_msg}). Retrying {retry_count}/{API_RETRIES}...")
+                    if retry_count > API_RETRIES:
+                        raise
+                    time.sleep(min(30, 2 ** retry_count * 2))
 
         response_text = response.choices[0].message.content if response else ""
         if not response_text: raise ValueError("Empty response.")
