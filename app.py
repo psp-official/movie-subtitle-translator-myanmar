@@ -19,8 +19,8 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-# OpenRouter တွင် အခမဲ့ပေးထားသော မော်ဒယ်ကို Default အနေဖြင့် သတ်မှတ်ထားပါသည်
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+# OpenRouter တွင် လုံးဝအခမဲ့ဖြစ်ပြီး မြန်မာစာအထောက်အပံ့ကောင်းသော မော်ဒယ်
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-2-9b-it:free")
 API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "25"))))
 API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
