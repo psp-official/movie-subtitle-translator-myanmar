@@ -7,6 +7,10 @@ import tempfile
 import subprocess
 
 from pathlib import Path
+from collections import defaultdict
+from difflib import SequenceMatcher
+
+import cv2
 
 from flask import Flask, request, jsonify, Response, render_template
 from werkzeug.utils import secure_filename
@@ -30,42 +34,42 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
 GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
+    "GEMINI_MODEL", "gemini-3.5-flash-lite"
 ).strip()
 
 GROQ_STT_MODEL = os.getenv(
-    "GROQ_STT_MODEL",
-    "whisper-large-v3"
+    "GROQ_STT_MODEL", "whisper-large-v3"
 ).strip()
 
 OCR_INTERVAL_SECONDS = max(
     0.25,
-    float(os.getenv("OCR_INTERVAL_SECONDS", "0.5"))
+    float(os.getenv("OCR_INTERVAL_SECONDS", "0.25"))
 )
 
 OCR_CONFIDENCE = max(
     0.0,
-    min(1.0, float(os.getenv("OCR_CONFIDENCE", "0.45")))
+    min(1.0, float(os.getenv("OCR_CONFIDENCE", "0.40")))
 )
 
 AUDIO_CHUNK_SECONDS = max(
-    60,
-    int(os.getenv("AUDIO_CHUNK_SECONDS", "300"))
+    60, int(os.getenv("AUDIO_CHUNK_SECONDS", "300"))
 )
 
 TRANSLATION_BATCH_SIZE = max(
-    1,
-    min(50, int(os.getenv("TRANSLATION_BATCH_SIZE", "20")))
+    1, min(50, int(os.getenv("TRANSLATION_BATCH_SIZE", "20")))
 )
 
 MAX_RETRIES = 3
 
-# OCR subtitle filtering
-OCR_CROP_TOP_RATIO = 0.35
+# Auto subtitle detection settings
+AUTO_SCAN_INTERVAL = 1.5
+AUTO_REGION_HALF_HEIGHT = 0.14
+AUTO_MIN_REGION_HEIGHT = 0.16
+AUTO_MAX_REGION_HEIGHT = 0.42
+
 OCR_MIN_PERSISTENCE = 2
-OCR_MAX_EMPTY_GAP = 1.0
-OCR_MAX_LINES = 2
+OCR_MAX_EMPTY_GAP = 0.75
+OCR_MAX_LINES = 3
 
 _gemini_client = None
 _groq_client = None
@@ -172,7 +176,7 @@ def require_ffmpeg():
 
     if not shutil.which("ffprobe"):
         raise RuntimeError(
-            "FFprobe မတွေ့ပါ။ FFmpeg/FFprobe ကိုတပ်ဆင်ပါ။"
+            "FFprobe မတွေ့ပါ။ Server တွင် FFmpeg/FFprobe တပ်ဆင်ပါ။"
         )
 
 
@@ -180,7 +184,10 @@ def run_ffmpeg(args, timeout=600):
     require_ffmpeg()
 
     result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-y", *args
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -203,8 +210,7 @@ def get_video_info(video_path):
 
     result = subprocess.run(
         [
-            "ffprobe",
-            "-v", "error",
+            "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(video_path),
@@ -273,7 +279,9 @@ def parse_time_range(value):
     if not isinstance(value, str):
         return None, None
 
-    parts = re.split(r"\s*-->\s*", value.strip(), maxsplit=1)
+    parts = re.split(
+        r"\s*-->\s*", value.strip(), maxsplit=1
+    )
 
     if len(parts) != 2:
         return None, None
@@ -411,8 +419,7 @@ def split_audio(audio_path, output_dir):
 
     while offset < duration:
         output_path = os.path.join(
-            output_dir,
-            f"audio_chunk_{index:04d}.wav"
+            output_dir, f"audio_chunk_{index:04d}.wav"
         )
 
         length = min(chunk_seconds, duration - offset)
@@ -469,10 +476,11 @@ def transcribe_audio_chunk(audio_path, offset=0.0):
                     model=GROQ_STT_MODEL,
                     language="zh",
                     prompt=(
-                        "这是一段中文影视对白。请准确识别普通话语音，"
-                        "特别注意人名、地名、门派名称、修炼境界和武功名称。"
-                        "保留原始中文，不要翻译，不要改写，不要遗漏对白，"
-                        "不要自行添加内容。"
+                        "这是一段中文武侠、仙侠、修仙题材影视对白。"
+                        "请准确识别普通话语音，特别注意人名、地名、"
+                        "门派名称、修炼境界和武功名称。"
+                        "保留原始中文，不要翻译，不要改写，"
+                        "不要遗漏对白，不要自行添加内容。"
                     ),
                     temperature=0,
                     response_format="verbose_json",
@@ -537,8 +545,18 @@ def transcribe_video_audio(video_path, output_dir):
 
 
 # =========================================================
-# OCR: READ SUBTITLE TEXT FROM VIDEO FRAMES
+# OCR: AUTO SUBTITLE REGION DETECTION
 # =========================================================
+
+def _text_similarity(first, second):
+    first = re.sub(r"\s+", "", clean_text(first))
+    second = re.sub(r"\s+", "", clean_text(second))
+
+    if not first or not second:
+        return 0.0
+
+    return SequenceMatcher(None, first, second).ratio()
+
 
 def _box_center_y(box):
     try:
@@ -566,90 +584,22 @@ def _box_width(box):
         return 0.0
 
 
-def _join_detections_into_lines(detections):
+def _ocr_detections(frame, y_offset=0):
     """
-    Group OCR detections that appear on the same horizontal line.
-    Coordinates are relative to the cropped image.
-    """
-
-    if not detections:
-        return []
-
-    detections = sorted(
-        detections,
-        key=lambda item: (item["center_y"], item["center_x"])
-    )
-
-    grouped = []
-
-    for detection in detections:
-        matched_group = None
-
-        for group in grouped:
-            average_y = sum(
-                item["center_y"] for item in group
-            ) / len(group)
-
-            if abs(detection["center_y"] - average_y) <= 22:
-                matched_group = group
-                break
-
-        if matched_group is None:
-            grouped.append([detection])
-        else:
-            matched_group.append(detection)
-
-    lines = []
-
-    for group in grouped:
-        group.sort(key=lambda item: item["center_x"])
-
-        line_text = clean_text(
-            " ".join(item["text"] for item in group)
-        )
-
-        if line_text:
-            average_y = sum(
-                item["center_y"] for item in group
-            ) / len(group)
-
-            lines.append({
-                "center_y": average_y,
-                "text": line_text,
-                "width": sum(
-                    item["width"] for item in group
-                ),
-            })
-
-    return sorted(lines, key=lambda item: item["center_y"])
-
-
-def ocr_frame_text(frame):
-    """
-    Focus on likely subtitle areas.
-
-    Supports multiple scripts according to what the installed OCR
-    model can recognize. It does not hard-code Chinese-only filtering.
+    Read detected text and return bounding boxes using
+    coordinates relative to the original video frame.
     """
 
     engine = get_ocr_engine()
 
-    height, width = frame.shape[:2]
-
-    crop_top = int(height * OCR_CROP_TOP_RATIO)
-    cropped = frame[crop_top:height, 0:width]
-
-    if cropped.size == 0:
-        return ""
-
     try:
-        result, _ = engine(cropped)
+        result, _ = engine(frame)
     except Exception:
         app.logger.exception("OCR frame processing failed")
-        return ""
+        return []
 
     if not result:
-        return ""
+        return []
 
     detections = []
 
@@ -666,62 +616,346 @@ def ocr_frame_text(frame):
         if not text or confidence < OCR_CONFIDENCE:
             continue
 
-        center_y = _box_center_y(box)
-        center_x = _box_center_x(box)
-        box_width = _box_width(box)
+        try:
+            xs = [float(point[0]) for point in box]
+            ys = [float(point[1]) for point in box]
+        except (TypeError, ValueError, IndexError):
+            continue
 
-        # Ignore very small detections likely to be noise.
-        if box_width < 8:
+        if not xs or not ys:
+            continue
+
+        box_width = max(xs) - min(xs)
+        box_height = max(ys) - min(ys)
+
+        if box_width < 8 or box_height < 5:
             continue
 
         detections.append({
             "text": text,
-            "center_y": center_y,
-            "center_x": center_x,
-            "width": box_width,
             "confidence": confidence,
+            "x1": min(xs),
+            "x2": max(xs),
+            "y1": min(ys) + y_offset,
+            "y2": max(ys) + y_offset,
+            "center_x": (min(xs) + max(xs)) / 2,
+            "center_y": (
+                (min(ys) + max(ys)) / 2
+            ) + y_offset,
+            "width": box_width,
+            "height": box_height,
         })
 
-    if not detections:
-        return ""
+    return detections
 
-    lines = _join_detections_into_lines(detections)
+
+def _group_ocr_lines(detections, y_tolerance=22):
+    """
+    Group OCR boxes that are located on the same text line.
+    """
+
+    if not detections:
+        return []
+
+    ordered = sorted(
+        detections,
+        key=lambda item: (
+            item["center_y"], item["center_x"]
+        )
+    )
+
+    groups = []
+
+    for detection in ordered:
+        matched_group = None
+
+        for group in groups:
+            average_y = sum(
+                item["center_y"] for item in group
+            ) / len(group)
+
+            tolerance = max(
+                y_tolerance,
+                detection["height"] * 0.8
+            )
+
+            if abs(
+                detection["center_y"] - average_y
+            ) <= tolerance:
+                matched_group = group
+                break
+
+        if matched_group is None:
+            groups.append([detection])
+        else:
+            matched_group.append(detection)
+
+    lines = []
+
+    for group in groups:
+        group.sort(key=lambda item: item["center_x"])
+
+        text = clean_text(
+            " ".join(item["text"] for item in group)
+        )
+
+        if not text:
+            continue
+
+        lines.append({
+            "text": text,
+            "center_y": sum(
+                item["center_y"] for item in group
+            ) / len(group),
+            "confidence": sum(
+                item["confidence"] for item in group
+            ) / len(group),
+            "width": sum(
+                item["width"] for item in group
+            ),
+        })
+
+    return sorted(
+        lines,
+        key=lambda item: item["center_y"]
+    )
+
+
+def detect_subtitle_region(video_path):
+    """
+    Scan representative frames and estimate the vertical area
+    where text appears repeatedly. Returns (y1, y2), or None.
+    """
+
+    capture = cv2.VideoCapture(str(video_path))
+
+    if not capture.isOpened():
+        capture.release()
+        return None
+
+    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+    frame_height = int(
+        capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    )
+
+    if fps <= 0:
+        fps = 25.0
+
+    if frame_count <= 0 or frame_height <= 0:
+        capture.release()
+        return None
+
+    duration = frame_count / fps
+    band_height = max(12, int(frame_height * 0.06))
+
+    band_scores = defaultdict(float)
+    band_counts = defaultdict(int)
+    sampled_frames = 0
+    timestamp = 0.0
+
+    try:
+        while timestamp < duration:
+            capture.set(
+                cv2.CAP_PROP_POS_MSEC,
+                timestamp * 1000
+            )
+
+            success, frame = capture.read()
+
+            if not success:
+                timestamp += AUTO_SCAN_INTERVAL
+                continue
+
+            sampled_frames += 1
+
+            height, width = frame.shape[:2]
+            detections = _ocr_detections(frame)
+
+            for detection in detections:
+                relative_y = (
+                    detection["center_y"] / max(1, height)
+                )
+
+                # Do not absolutely restrict the subtitle to the
+                # bottom, but reduce the score of text near the top.
+                if relative_y < 0.12:
+                    continue
+
+                band = int(
+                    detection["center_y"] / band_height
+                )
+
+                width_ratio = (
+                    detection["width"] / max(1, width)
+                )
+
+                position_bonus = 1.0 + (
+                    0.25 * relative_y
+                )
+
+                width_bonus = min(
+                    1.5,
+                    0.5 + width_ratio * 4
+                )
+
+                score = (
+                    detection["confidence"]
+                    * position_bonus
+                    * width_bonus
+                )
+
+                band_scores[band] += score
+                band_counts[band] += 1
+
+            timestamp += AUTO_SCAN_INTERVAL
+
+    finally:
+        capture.release()
+
+    if not band_scores or sampled_frames == 0:
+        return None
+
+    ranked = []
+
+    for band in set(band_scores.keys()):
+        score = 0.0
+        count = 0
+
+        # Include neighboring bands to tolerate small movements.
+        for neighbor in (band - 1, band, band + 1):
+            score += band_scores.get(neighbor, 0.0)
+            count += band_counts.get(neighbor, 0)
+
+        if count:
+            ranked.append((
+                score + count * 0.08,
+                count,
+                band
+            ))
+
+    if not ranked:
+        return None
+
+    ranked.sort(reverse=True)
+    best_score, best_count, best_band = ranked[0]
+
+    # Require repeated detections instead of relying on a single frame.
+    if best_count < 2:
+        return None
+
+    center_y = (
+        best_band * band_height
+        + band_height / 2
+    )
+
+    half_height = max(
+        int(frame_height * AUTO_REGION_HALF_HEIGHT),
+        int(frame_height * AUTO_MIN_REGION_HEIGHT / 2),
+    )
+
+    half_height = min(
+        half_height,
+        int(frame_height * AUTO_MAX_REGION_HEIGHT / 2),
+    )
+
+    y1 = max(0, int(center_y - half_height))
+    y2 = min(
+        frame_height,
+        int(center_y + half_height)
+    )
+
+    if y2 <= y1:
+        return None
+
+    app.logger.info(
+        "Auto subtitle region: y=%s..%s; frame_height=%s; "
+        "detections=%s",
+        y1, y2, frame_height, best_count
+    )
+
+    return y1, y2
+
+
+def ocr_frame_text(frame, region=None):
+    """
+    First read the automatically detected region.
+    If no text is found, retry on the full frame.
+    """
+
+    height, width = frame.shape[:2]
+
+    if region is not None:
+        y1, y2 = region
+
+        y1 = max(0, min(height - 1, int(y1)))
+        y2 = max(y1 + 1, min(height, int(y2)))
+
+        cropped = frame[y1:y2, 0:width]
+
+        detections = _ocr_detections(
+            cropped,
+            y_offset=y1
+        )
+
+        lines = _group_ocr_lines(
+            detections,
+            y_tolerance=max(12, int(height * 0.018))
+        )
+
+        if lines:
+            return " ".join(
+                line["text"]
+                for line in lines[-OCR_MAX_LINES:]
+            )
+
+    # Recovery: inspect the full frame if the target region
+    # does not return text.
+    detections = _ocr_detections(frame)
+
+    lines = _group_ocr_lines(
+        detections,
+        y_tolerance=max(12, int(height * 0.018))
+    )
 
     if not lines:
         return ""
 
-    # Keep only the bottom-most likely subtitle lines.
-    # This reduces logos and text higher up in the frame.
-    lines = lines[-OCR_MAX_LINES:]
+    if region is not None:
+        region_center = (region[0] + region[1]) / 2
 
-    output = " ".join(
+        lines = sorted(
+            lines,
+            key=lambda line: abs(
+                line["center_y"] - region_center
+            )
+        )[:OCR_MAX_LINES]
+
+        lines.sort(key=lambda line: line["center_y"])
+
+    else:
+        lower_lines = [
+            line for line in lines
+            if line["center_y"] >= height * 0.35
+        ]
+
+        lines = (
+            lower_lines[-OCR_MAX_LINES:]
+            if lower_lines
+            else lines[-OCR_MAX_LINES:]
+        )
+
+    return " ".join(
         line["text"] for line in lines
     )
 
-    output = re.sub(r"\s+", " ", output).strip()
-
-    return output
-
-
-def _text_similarity(first, second):
-    from difflib import SequenceMatcher
-
-    first = re.sub(r"\s+", "", clean_text(first))
-    second = re.sub(r"\s+", "", clean_text(second))
-
-    if not first or not second:
-        return 0.0
-
-    return SequenceMatcher(None, first, second).ratio()
-
 
 def extract_ocr_subtitles(video_path):
-    try:
-        import cv2
-    except ImportError as exc:
-        raise RuntimeError(
-            "OpenCV library မရှိပါ။"
-        ) from exc
+    """
+    Two-pass OCR:
+      1. Automatically locate a likely subtitle region.
+      2. Read the video over time and track subtitle changes.
+    """
 
     capture = cv2.VideoCapture(str(video_path))
 
@@ -730,19 +964,33 @@ def extract_ocr_subtitles(video_path):
         raise RuntimeError("ဗီဒီယိုဖိုင်ကို ဖွင့်မရပါ။")
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
 
     if fps <= 0:
         fps = 25.0
 
-    frame_count_total = capture.get(cv2.CAP_PROP_FRAME_COUNT)
-
     duration = (
-        frame_count_total / fps
-        if frame_count_total > 0
+        frame_count / fps
+        if frame_count > 0
         else None
     )
 
-    interval = max(0.25, OCR_INTERVAL_SECONDS)
+    capture.release()
+
+    # First pass: find the most likely subtitle region.
+    region = detect_subtitle_region(video_path)
+
+    if region is None:
+        app.logger.warning(
+            "Auto subtitle region not found; using recovery scanning."
+        )
+
+    # Second pass: track subtitles over time.
+    capture = cv2.VideoCapture(str(video_path))
+
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError("ဗီဒီယိုကို OCR အတွက် ပြန်ဖွင့်မရပါ။")
 
     items = []
 
@@ -754,10 +1002,13 @@ def extract_ocr_subtitles(video_path):
     pending_count = 0
     pending_start = 0.0
 
+    interval = max(0.25, OCR_INTERVAL_SECONDS)
     frame_number = 0
 
     def finish_current(end_time):
-        nonlocal current_text, current_start, last_seen_time
+        nonlocal current_text
+        nonlocal current_start
+        nonlocal last_seen_time
 
         if not current_text:
             return
@@ -784,7 +1035,10 @@ def extract_ocr_subtitles(video_path):
         while True:
             timestamp = frame_number / fps
 
-            if duration is not None and timestamp >= duration:
+            if (
+                duration is not None
+                and timestamp >= duration
+            ):
                 break
 
             capture.set(
@@ -797,20 +1051,21 @@ def extract_ocr_subtitles(video_path):
             if not success:
                 break
 
-            detected_text = ocr_frame_text(frame)
+            detected_text = clean_text(
+                ocr_frame_text(frame, region=region)
+            )
+
             detected_text = re.sub(
                 r"\s+", " ", detected_text
             ).strip()
 
             if detected_text:
                 if not current_text:
-                    # Require repeated detections before accepting
-                    # a new subtitle to reduce one-frame noise.
                     if (
                         pending_text
                         and _text_similarity(
                             pending_text, detected_text
-                        ) >= 0.80
+                        ) >= 0.78
                     ):
                         pending_count += 1
                     else:
@@ -831,25 +1086,23 @@ def extract_ocr_subtitles(video_path):
                         current_text, detected_text
                     )
 
-                    if similarity >= 0.72:
-                        # Keep the current subtitle together even if
-                        # OCR makes minor recognition mistakes.
-                        if len(detected_text) >= len(current_text) * 0.65:
+                    if similarity >= 0.70:
+                        if (
+                            len(detected_text)
+                            >= len(current_text) * 0.65
+                        ):
                             current_text = detected_text
 
                         last_seen_time = timestamp
-
                         pending_text = ""
                         pending_count = 0
 
                     else:
-                        # Confirm a different subtitle over multiple
-                        # samples before ending the previous subtitle.
                         if (
                             pending_text
                             and _text_similarity(
                                 pending_text, detected_text
-                            ) >= 0.80
+                            ) >= 0.78
                         ):
                             pending_count += 1
                         else:
@@ -873,14 +1126,18 @@ def extract_ocr_subtitles(video_path):
 
                 if (
                     current_text
-                    and timestamp - last_seen_time > OCR_MAX_EMPTY_GAP
+                    and timestamp - last_seen_time
+                    > OCR_MAX_EMPTY_GAP
                 ):
                     finish_current(
                         last_seen_time + interval
                     )
 
-            frame_number = int(
-                round((timestamp + interval) * fps)
+            frame_number = max(
+                frame_number + 1,
+                int(round(
+                    (timestamp + interval) * fps
+                ))
             )
 
     finally:
@@ -895,14 +1152,11 @@ def extract_ocr_subtitles(video_path):
 
         finish_current(end_time)
 
-    # Remove duplicates and invalid subtitle segments.
+    # Merge repeated duplicate entries when they are adjacent.
     final_items = []
 
     for item in renumber_items(items):
-        if item["end"] <= item["start"]:
-            continue
-
-        if not item["text"]:
+        if item["end"] <= item["start"] or not item["text"]:
             continue
 
         if final_items:
@@ -922,6 +1176,7 @@ def extract_ocr_subtitles(video_path):
                 previous["end"] = max(
                     previous["end"], item["end"]
                 )
+
                 previous["time"] = (
                     f"{make_timestamp(previous['start'])} --> "
                     f"{make_timestamp(previous['end'])}"
@@ -1219,8 +1474,7 @@ def process_video():
         ) as temp_dir:
 
             video_path = os.path.join(
-                temp_dir,
-                "input" + extension
+                temp_dir, "input" + extension
             )
 
             upload.save(video_path)
@@ -1244,13 +1498,11 @@ def process_video():
                 )
 
             else:
-                # Auto mode: try video subtitles first.
+                # Auto mode: try OCR first, then audio transcription.
                 source_items = extract_ocr_subtitles(
                     video_path
                 )
 
-                # Fall back to speech recognition when OCR
-                # does not find usable subtitle text.
                 if not source_items:
                     source_items = transcribe_video_audio(
                         video_path, temp_dir
