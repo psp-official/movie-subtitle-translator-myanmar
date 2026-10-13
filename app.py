@@ -1,1105 +1,1383 @@
-
-import json
-import logging
 import os
 import re
-import shutil
-import subprocess
-import tempfile
+import json
 import time
-import traceback
-from collections import OrderedDict
-from difflib import SequenceMatcher
-from io import BytesIO
-from pathlib import Path
-from google import genai
+import shutil
+import tempfile
+import subprocess
 
-from flask import Flask, jsonify, render_template, request, send_file
+from pathlib import Path
+from functools import lru_cache
+
+from flask import Flask, request, jsonify, Response
 from werkzeug.utils import secure_filename
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 app = Flask(__name__)
 
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
-app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.getenv("MAX_UPLOAD_MB", "500")
+) * 1024 * 1024
 
-UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ALLOWED_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".avi",
+}
 
-ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
-GEMINI_BATCH_SIZE = max(1, min(30, int(os.getenv("GEMINI_BATCH_SIZE", "20"))))
-GEMINI_RETRIES = max(0, min(5, int(os.getenv("GEMINI_RETRIES", "3"))))
-OCR_FPS = max(1, min(8, int(os.getenv("OCR_FPS", "4"))))
-OCR_CONFIDENCE = max(0.0, min(1.0, float(os.getenv("OCR_CONFIDENCE", "0.45"))))
-SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
-AUDIO_CHUNK_SECONDS = max(60, min(600, int(os.getenv("AUDIO_CHUNK_SECONDS", "480"))))
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash-lite"
+).strip()
 
-TRANSLATION_CACHE_MAX = 5000
-TRANSLATION_CACHE = OrderedDict()
+GROQ_STT_MODEL = os.getenv(
+    "GROQ_STT_MODEL",
+    "whisper-large-v3"
+).strip()
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+# OCR samples one frame every N seconds.
+OCR_INTERVAL_SECONDS = float(
+    os.getenv("OCR_INTERVAL_SECONDS", "0.5")
+)
 
+# Audio chunks are kept short enough to reduce upload-size issues.
+AUDIO_CHUNK_SECONDS = int(
+    os.getenv("AUDIO_CHUNK_SECONDS", "300")
+)
 
-def get_field(obj, name, default=None):
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
+TRANSLATION_BATCH_SIZE = int(
+    os.getenv("TRANSLATION_BATCH_SIZE", "20")
+)
 
+MAX_RETRIES = 3
 
-def make_timestamp(seconds):
-    milliseconds = int(round(max(0.0, float(seconds)) * 1000))
-    hours, remainder = divmod(milliseconds, 3600000)
-    minutes, remainder = divmod(remainder, 60000)
-    seconds, milliseconds = divmod(remainder, 1000)
-    return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+app.logger.info("Movie Subtitle AI starting...")
 
 
-def format_subtitle(text, max_chars=22):
-    text = re.sub(r"\s+", " ", str(text or "")).strip()
+# =========================================================
+# OPTIONAL CLIENTS
+# =========================================================
 
-    if not text:
-        return ""
+_gemini_client = None
+_groq_client = None
+_ocr_engine = None
 
-    if len(text) <= max_chars:
-        return text
 
-    if " " not in text:
-        if len(text) <= max_chars * 2:
-            return text[:max_chars] + "\n" + text[max_chars:]
-        return text[:max_chars] + "\n" + text[max_chars:max_chars * 2]
+def get_gemini_client():
+    global _gemini_client
 
-    words = text.split()
-    lines = []
-    current = ""
+    if _gemini_client is not None:
+        return _gemini_client
 
-    for word in words:
-        candidate = f"{current} {word}".strip()
-
-        if len(candidate) <= max_chars:
-            current = candidate
-        elif not current:
-            lines.append(word[:max_chars])
-            current = word[max_chars:]
-        else:
-            lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    if len(lines) <= 2:
-        return "\n".join(lines)
-
-    return lines[0] + "\n" + " ".join(lines[1:])
-
-
-def clean_json_response(text):
-    text = str(text or "").strip()
-    text = re.sub(
-        r"^\s*```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-    text = re.sub(r"\s*```\s*$", "", text)
-    return text.strip()
-
-
-def cache_get(text):
-    key = re.sub(r"\s+", " ", str(text or "")).strip()
-    value = TRANSLATION_CACHE.get(key)
-
-    if value is not None:
-        TRANSLATION_CACHE.move_to_end(key)
-
-    return key, value
-
-
-def cache_put(key, value):
-    if not str(value or "").strip():
-        return
-
-    TRANSLATION_CACHE[key] = value
-    TRANSLATION_CACHE.move_to_end(key)
-
-    while len(TRANSLATION_CACHE) > TRANSLATION_CACHE_MAX:
-        TRANSLATION_CACHE.popitem(last=False)
-
-
-def make_translation_prompt(uncached):
-    return f"""
-You are an expert Chinese-to-Myanmar subtitle translator.
-
-Translate every Chinese dialogue line into natural, concise,
-spoken Myanmar Burmese suitable for movie subtitles.
-
-RULES:
-- Preserve meaning, emotion, intent, and character relationships.
-- Use natural Burmese dialogue, not stiff word-for-word translation.
-- Interpret idioms, insults, jokes, honorifics, and fantasy terms from context.
-- Do not add explanations, narration, labels, or translator notes.
-- Use Myanmar script.
-- Translate every item. Do not omit, merge, reorder, or duplicate IDs.
-- Keep dialogue concise enough for subtitles.
-- Return ONLY a valid JSON array.
-- Each object must have integer "id" and string "myanmar".
-
-Example:
-[{{"id": 0, "myanmar": "မင်း ဘာလုပ်နေတာလဲ။"}}]
-
-Input:
-{json.dumps(uncached, ensure_ascii=False)}
-""".strip()
-
-
-def translate_batch(client, segments):
-    translations = {}
-    uncached = []
-    cache_keys = {}
-
-    for index, segment in enumerate(segments):
-        source_text = str(segment.get("text", "")).strip()
-        key, cached = cache_get(source_text)
-        cache_keys[index] = key
-
-        if cached is not None:
-            translations[index] = cached
-        else:
-            uncached.append({
-                "id": index,
-                "text": source_text
-            })
-
-    if uncached:
-        from google.genai import types
-
-        prompt = make_translation_prompt(uncached)
-        response_text = ""
-
-        for attempt in range(GEMINI_RETRIES + 1):
-            try:
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        response_mime_type="application/json"
-                    )
-                )
-
-                response_text = str(
-                    get_field(response, "text", "") or ""
-                ).strip()
-
-                if not response_text:
-                    raise ValueError("Gemini returned an empty response.")
-
-                break
-
-            except Exception as exc:
-                if attempt >= GEMINI_RETRIES:
-                    app.logger.exception("Gemini translation failed")
-                    raise RuntimeError(
-                        f"Gemini translation failed: {exc}"
-                    ) from exc
-
-                time.sleep(min(12, 2 ** (attempt + 1)))
-
-        try:
-            parsed = json.loads(clean_json_response(response_text))
-
-        except json.JSONDecodeError:
-            app.logger.warning(
-                "Gemini returned invalid JSON; attempting repair."
-            )
-
-            repair_prompt = (
-                "Convert the following content into ONLY a valid JSON "
-                'array with integer "id" and string "myanmar". '
-                "Preserve the translation text. Fix JSON syntax only.\n\n"
-                + response_text
-            )
-
-            repaired = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=repair_prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    response_mime_type="application/json"
-                )
-            )
-
-            parsed = json.loads(
-                clean_json_response(
-                    get_field(repaired, "text", "")
-                )
-            )
-
-        if isinstance(parsed, dict):
-            parsed = parsed.get(
-                "translations",
-                parsed.get("items", [])
-            )
-
-        if not isinstance(parsed, list):
-            raise RuntimeError("Gemini response was not a JSON array.")
-
-        returned = {}
-
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-
-            try:
-                item_id = int(item.get("id"))
-            except (TypeError, ValueError):
-                continue
-
-            translated = str(
-                item.get("myanmar", "") or ""
-            ).strip()
-
-            if translated:
-                returned[item_id] = translated
-
-        for item in uncached:
-            index = item["id"]
-            translated = returned.get(index, "")
-
-            if translated:
-                translations[index] = translated
-                cache_put(cache_keys[index], translated)
-            else:
-                # Avoid returning an empty subtitle.
-                translations[index] = item["text"]
-
-    return [
-        str(translations.get(i, segments[i].get("text", ""))).strip()
-        for i in range(len(segments))
-    ]
-
-
-
-def run_ocr_extraction(video_path):
-    import cv2
-    from rapidocr_onnxruntime import RapidOCR
-
-    ocr = RapidOCR()
-    cap = cv2.VideoCapture(str(video_path))
-
-    if not cap.isOpened():
-        raise RuntimeError("Could not open video for OCR.")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0:
-        fps = 25.0
-
-    frame_interval = max(1, int(round(fps / OCR_FPS)))
-    sample_interval = frame_interval / fps
-
-    segments = []
-    current_text = ""
-    current_start = 0.0
-    last_seen = 0.0
-    frame_count = 0
-
-    try:
-        while True:
-            success, frame = cap.read()
-
-            if not success:
-                break
-
-            if frame_count % frame_interval == 0:
-                height, width = frame.shape[:2]
-
-                # Include the lower 60% of the frame to support
-                # both horizontal and vertical videos.
-                crop = frame[int(height * 0.40):height, 0:width]
-
-                if crop.size:
-                    result, _ = ocr(crop)
-                else:
-                    result = None
-
-                lines = []
-
-                if result:
-                    for line in result:
-                        try:
-                            text = str(line[1]).strip()
-                            confidence = float(line[2])
-                        except (IndexError, TypeError, ValueError):
-                            continue
-
-                        if (
-                            confidence >= OCR_CONFIDENCE
-                            and re.search(r"[\u4e00-\u9fff]", text)
-                        ):
-                            lines.append(text)
-
-                frame_text = re.sub(
-                    r"\s+", " ", " ".join(lines)
-                ).strip()
-
-                timestamp = frame_count / fps
-
-                if frame_text:
-                    if not current_text:
-                        current_text = frame_text
-                        current_start = timestamp
-                        last_seen = timestamp
-
-                    else:
-                        similarity = SequenceMatcher(
-                            None, current_text, frame_text
-                        ).ratio()
-
-                        if similarity >= 0.72:
-                            # Reduce unnecessary splitting when OCR
-                            # makes small character-recognition errors.
-                            if len(frame_text) >= len(current_text) * 0.7:
-                                current_text = frame_text
-
-                            last_seen = timestamp
-
-                        else:
-                            end_time = max(
-                                current_start + 0.15,
-                                last_seen + sample_interval
-                            )
-
-                            segments.append({
-                                "start": current_start,
-                                "end": end_time,
-                                "text": current_text
-                            })
-
-                            current_text = frame_text
-                            current_start = timestamp
-                            last_seen = timestamp
-
-                elif current_text:
-                    end_time = max(
-                        current_start + 0.15,
-                        last_seen + sample_interval
-                    )
-
-                    segments.append({
-                        "start": current_start,
-                        "end": end_time,
-                        "text": current_text
-                    })
-
-                    current_text = ""
-
-            frame_count += 1
-
-        if current_text:
-            end_time = max(
-                current_start + 0.15,
-                last_seen + sample_interval
-            )
-
-            segments.append({
-                "start": current_start,
-                "end": end_time,
-                "text": current_text
-            })
-
-    finally:
-        cap.release()
-
-    final_segments = []
-
-    for segment in segments:
-        segment["start"] = max(0.0, float(segment["start"]))
-        segment["end"] = max(
-            segment["start"] + 0.15,
-            float(segment["end"])
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY ကို Render Environment Variables "
+            "ထဲမှာ ထည့်ပေးပါ။"
         )
-        segment["text"] = re.sub(
-            r"\s+", " ", segment["text"]
-        ).strip()
-
-        if not segment["text"]:
-            continue
-
-        if segment["end"] - segment["start"] < 0.20:
-            continue
-
-        if final_segments:
-            previous = final_segments[-1]
-
-            same_text = (
-                SequenceMatcher(
-                    None,
-                    previous["text"],
-                    segment["text"]
-                ).ratio() >= 0.90
-            )
-
-            adjacent = (
-                segment["start"] - previous["end"] <= 0.12
-            )
-
-            if same_text and adjacent:
-                previous["end"] = segment["end"]
-                continue
-
-        final_segments.append(segment)
-
-    return final_segments
-
-
-def check_has_hardcoded_subs(video_path):
-    """Quickly scan up to 60 seconds for Chinese hardcoded subtitles."""
-    import cv2
-    from rapidocr_onnxruntime import RapidOCR
-
-    cap = cv2.VideoCapture(str(video_path))
-
-    if not cap.isOpened():
-        return False
 
     try:
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        from google import genai
+    except ImportError as exc:
+        raise RuntimeError(
+            "google-genai library မတပ်ဆင်ရသေးပါ။ "
+            "requirements.txt ထဲမှာ google-genai ထည့်ပေးပါ။"
+        ) from exc
 
-        if not fps or fps <= 0:
-            fps = 25.0
+    _gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
-        frame_interval = max(1, int(round(fps)))
-        max_scan_frames = int(fps * 60)
-
-        ocr = RapidOCR()
-        chinese_frames = 0
-        frame_count = 0
-
-        while frame_count < max_scan_frames:
-            success, frame = cap.read()
-
-            if not success:
-                break
-
-            if frame_count % frame_interval == 0:
-                height, width = frame.shape[:2]
-                crop = frame[int(height * 0.40):height, 0:width]
-
-                result, _ = ocr(crop)
-
-                if result:
-                    found_chinese = False
-
-                    for line in result:
-                        try:
-                            text = str(line[1])
-                            confidence = float(line[2])
-                        except (IndexError, TypeError, ValueError):
-                            continue
-
-                        if (
-                            confidence >= OCR_CONFIDENCE
-                            and re.search(r"[\u4e00-\u9fff]", text)
-                        ):
-                            found_chinese = True
-                            break
-
-                    if found_chinese:
-                        chinese_frames += 1
-
-                        if chinese_frames >= 3:
-                            return True
-
-            frame_count += 1
-
-    except Exception:
-        app.logger.exception("OCR subtitle detection failed")
-
-    finally:
-        cap.release()
-
-    return False
+    return _gemini_client
 
 
-def run_ffmpeg(args, timeout=1800):
+def get_groq_client():
+    global _groq_client
+
+    if _groq_client is not None:
+        return _groq_client
+
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "GROQ_API_KEY ကို Render Environment Variables "
+            "ထဲမှာ ထည့်ပေးပါ။"
+        )
+
+    try:
+        from groq import Groq
+    except ImportError as exc:
+        raise RuntimeError(
+            "groq library မတပ်ဆင်ရသေးပါ။ "
+            "requirements.txt ထဲမှာ groq ထည့်ပေးပါ။"
+        ) from exc
+
+    _groq_client = Groq(
+        api_key=GROQ_API_KEY,
+        timeout=180.0,
+        max_retries=2,
+    )
+
+    return _groq_client
+
+
+def get_ocr_engine():
+    global _ocr_engine
+
+    if _ocr_engine is not None:
+        return _ocr_engine
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as exc:
+        raise RuntimeError(
+            "RapidOCR library မတပ်ဆင်ရသေးပါ။ "
+            "requirements.txt ထဲမှာ rapidocr-onnxruntime "
+            "ထည့်ပေးပါ။"
+        ) from exc
+
+    _ocr_engine = RapidOCR()
+
+    return _ocr_engine
+
+
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
+
+def allowed_file(filename):
+    return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
+
+
+def require_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "FFmpeg မတွေ့ပါ။ Render Environment မှာ "
+            "FFmpeg တပ်ဆင်ထားဖို့ လိုအပ်ပါတယ်။"
+        )
+
+
+def run_ffmpeg(args, timeout=600):
+    require_ffmpeg()
+
     command = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "error",
-        "-y"
-    ] + args
+        "-loglevel",
+        "error",
+        "-y",
+        *args,
+    ]
 
     result = subprocess.run(
         command,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout
+        timeout=timeout,
+        check=False,
     )
 
     if result.returncode != 0:
-        message = (result.stderr or "ffmpeg failed").strip()
-        raise RuntimeError(message[-1200:])
+        message = (result.stderr or "FFmpeg failed")[-1500:]
+        raise RuntimeError(
+            "ဗီဒီယို/အသံ ပြင်ဆင်ရာတွင် ပြဿနာဖြစ်နေပါသည်။ "
+            + message
+        )
 
     return result
 
 
-def transcribe_audio(video_path, job_dir, groq_client, total_delay=0.0):
-    """Extract audio, split it into chunks, and transcribe each chunk."""
-    audio_path = job_dir / "audio.mp3"
+def get_video_info(video_path):
+    require_ffmpeg()
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+
+    if shutil.which("ffprobe") is None:
+        return None
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        duration = float(result.stdout.strip())
+
+        if duration > 0:
+            return duration
+
+    except (TypeError, ValueError):
+        pass
+
+    return None
+
+
+def make_timestamp(seconds):
+    seconds = max(0.0, float(seconds or 0.0))
+
+    milliseconds = int(round(seconds * 1000))
+
+    hours = milliseconds // 3600000
+    milliseconds %= 3600000
+
+    minutes = milliseconds // 60000
+    milliseconds %= 60000
+
+    secs = milliseconds // 1000
+    milliseconds %= 1000
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{secs:02d},"
+        f"{milliseconds:03d}"
+    )
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str):
+        return None
+
+    match = re.match(
+        r"^\s*(\d+):([0-5]\d):([0-5]\d)[,.](\d{1,3})\s*$",
+        value,
+    )
+
+    if not match:
+        return None
+
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+
+    milliseconds = int(
+        match.group(4).ljust(3, "0")
+    )
+
+    return (
+        hours * 3600
+        + minutes * 60
+        + seconds
+        + milliseconds / 1000
+    )
+
+
+def parse_time_range(value):
+    if not isinstance(value, str):
+        return None, None
+
+    parts = re.split(
+        r"\s*-->\s*",
+        value.strip(),
+        maxsplit=1,
+    )
+
+    if len(parts) != 2:
+        return None, None
+
+    return (
+        parse_timestamp(parts[0]),
+        parse_timestamp(parts[1]),
+    )
+
+
+def clean_text(value):
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    text = text.replace("\x00", "")
+    text = text.replace("\r\n", "\n")
+    text = text.replace("\r", "\n")
+
+    return text.strip()
+
+
+def make_item(start, end, text, source=""):
+    start = max(0.0, float(start or 0.0))
+    end = max(start + 0.15, float(end or start + 2.0))
+
+    return {
+        "index": 0,
+        "start": start,
+        "end": end,
+        "time": (
+            f"{make_timestamp(start)} --> "
+            f"{make_timestamp(end)}"
+        ),
+        "text": clean_text(text),
+        "source": clean_text(source),
+    }
+
+
+def normalize_item(item, index=0):
+    if not isinstance(item, dict):
+        return None
+
+    text = clean_text(
+        item.get("text")
+        or item.get("translation")
+        or item.get("subtitle")
+        or ""
+    )
+
+    source = clean_text(item.get("source", ""))
+
+    raw_start = item.get(
+        "start",
+        item.get("start_time", item.get("begin")),
+    )
+
+    raw_end = item.get(
+        "end",
+        item.get("end_time", item.get("finish")),
+    )
+
+    raw_time = item.get("time", "")
+
+    parsed_start, parsed_end = parse_time_range(
+        raw_time
+    )
+
+    try:
+        start = (
+            float(raw_start)
+            if raw_start is not None
+            else parsed_start
+        )
+    except (ValueError, TypeError):
+        start = parsed_start
+
+    try:
+        end = (
+            float(raw_end)
+            if raw_end is not None
+            else parsed_end
+        )
+    except (ValueError, TypeError):
+        end = parsed_end
+
+    if start is None or end is None:
+        return None
+
+    if start < 0 or end <= start:
+        return None
+
+    result = make_item(
+        start=start,
+        end=end,
+        text=text,
+        source=source,
+    )
+
+    result["index"] = index + 1
+
+    return result
+
+
+def renumber_items(items):
+    cleaned = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        text = clean_text(item.get("text", ""))
+
+        if not text:
+            continue
+
+        normalized = normalize_item(
+            item,
+            index=len(cleaned),
+        )
+
+        if normalized is None:
+            continue
+
+        normalized["index"] = len(cleaned) + 1
+
+        cleaned.append(normalized)
+
+    cleaned.sort(
+        key=lambda item: item["start"]
+    )
+
+    for index, item in enumerate(cleaned, start=1):
+        item["index"] = index
+
+    return cleaned
+
+
+# =========================================================
+# AUDIO EXTRACTION
+# =========================================================
+
+def extract_audio(video_path, output_dir):
+    audio_path = os.path.join(
+        output_dir,
+        "audio.wav",
+    )
 
     run_ffmpeg([
         "-i", str(video_path),
         "-vn",
         "-ac", "1",
         "-ar", "16000",
-        "-b:a", "64k",
-        str(audio_path)
+        "-c:a", "pcm_s16le",
+        audio_path,
     ])
 
-    if not audio_path.exists() or audio_path.stat().st_size == 0:
-        raise ValueError("ဗီဒီယိုထဲမှာ အသံမတွေ့ပါ။")
+    if not os.path.exists(audio_path):
+        raise RuntimeError(
+            "ဗီဒီယိုထဲက အသံကို ထုတ်ယူမရပါ။"
+        )
 
-    chunk_dir = job_dir / "audio_chunks"
-    chunk_dir.mkdir(exist_ok=True)
+    if os.path.getsize(audio_path) < 1000:
+        raise RuntimeError(
+            "အသံဖိုင် မရှိပါ သို့မဟုတ် အလွန်တိုနေပါသည်။"
+        )
 
-    chunk_pattern = str(chunk_dir / "chunk_%04d.mp3")
+    return audio_path
 
-    run_ffmpeg([
-        "-i", str(audio_path),
-        "-f", "segment",
-        "-segment_time", str(AUDIO_CHUNK_SECONDS),
-        "-reset_timestamps", "1",
-        "-c", "copy",
-        chunk_pattern
-    ])
 
-    chunk_files = sorted(chunk_dir.glob("chunk_*.mp3"))
+def split_audio(audio_path, output_dir):
+    """
+    Split long audio into manageable WAV chunks.
+    Each chunk's original start offset is preserved.
+    """
 
-    if not chunk_files:
-        chunk_files = [audio_path]
+    require_ffmpeg()
 
-    raw_segments = []
+    duration = get_video_info(audio_path)
+
+    if not duration:
+        # WAV duration probe should normally succeed.
+        # If not, send the original file as one chunk.
+        return [(audio_path, 0.0)]
+
+    chunk_seconds = max(
+        60,
+        AUDIO_CHUNK_SECONDS,
+    )
+
+    if duration <= chunk_seconds:
+        return [(audio_path, 0.0)]
+
+    chunks = []
+
     offset = 0.0
+    index = 0
 
-    for chunk_path in chunk_files:
+    while offset < duration:
+        output_path = os.path.join(
+            output_dir,
+            f"audio_chunk_{index:04d}.wav",
+        )
+
+        length = min(
+            chunk_seconds,
+            duration - offset,
+        )
+
+        run_ffmpeg([
+            "-ss", str(offset),
+            "-i", str(audio_path),
+            "-t", str(length),
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            output_path,
+        ])
+
+        if os.path.exists(output_path):
+            if os.path.getsize(output_path) > 1000:
+                chunks.append(
+                    (output_path, offset)
+                )
+
+        offset += length
+        index += 1
+
+    if not chunks:
+        raise RuntimeError(
+            "အသံကို အပိုင်းပိုင်းခွဲထုတ်မရပါ။"
+        )
+
+    return chunks
+
+
+# =========================================================
+# GROQ WHISPER TRANSCRIPTION
+# =========================================================
+
+def get_segment_value(segment, key, default=None):
+    if isinstance(segment, dict):
+        return segment.get(key, default)
+
+    return getattr(segment, key, default)
+
+
+def transcribe_audio_chunk(audio_path, offset=0.0):
+    client = get_groq_client()
+
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
         try:
-            transcription = (
-                groq_client.audio.transcriptions.create(
+            with open(audio_path, "rb") as audio_file:
+                result = client.audio.transcriptions.create(
                     file=(
-                        chunk_path.name,
-                        chunk_path.read_bytes()
+                        os.path.basename(audio_path),
+                        audio_file.read(),
                     ),
                     model=GROQ_STT_MODEL,
                     language="zh",
                     response_format="verbose_json",
-                    timestamp_granularities=["segment"]
+                    timestamp_granularities=["segment"],
                 )
+
+            raw_segments = get_segment_value(
+                result,
+                "segments",
+                [],
             )
+
+            items = []
+
+            for segment in raw_segments or []:
+                start = get_segment_value(
+                    segment,
+                    "start",
+                    None,
+                )
+
+                end = get_segment_value(
+                    segment,
+                    "end",
+                    None,
+                )
+
+                text = clean_text(
+                    get_segment_value(
+                        segment,
+                        "text",
+                        "",
+                    )
+                )
+
+                if not text:
+                    continue
+
+                try:
+                    start = float(start) + offset
+                    end = float(end) + offset
+                except (TypeError, ValueError):
+                    continue
+
+                if end <= start:
+                    end = start + 0.5
+
+                items.append(
+                    make_item(
+                        start,
+                        end,
+                        text,
+                        source=text,
+                    )
+                )
+
+            return items
 
         except Exception as exc:
-            app.logger.exception(
-                "Groq transcription failed: %s",
-                chunk_path.name
-            )
+            last_error = exc
 
-            raise RuntimeError(
-                "အသံကို စာသားပြောင်းမရပါ။ GROQ_API_KEY၊ "
-                "API quota နဲ့ STT model ကို စစ်ပါ။"
-            ) from exc
+            if attempt + 1 < MAX_RETRIES:
+                time.sleep(1.5 * (attempt + 1))
 
-        chunk_segments = (
-            get_field(transcription, "segments", []) or []
-        )
-
-        for segment in chunk_segments:
-            text = str(
-                get_field(segment, "text", "") or ""
-            ).strip()
-
-            if not text:
-                continue
-
-            try:
-                start = (
-                    float(get_field(segment, "start", 0.0))
-                    + offset
-                )
-
-                end = (
-                    float(get_field(segment, "end", 0.0))
-                    + offset
-                )
-
-            except (TypeError, ValueError):
-                continue
-
-            if end <= start:
-                end = start + 0.25
-
-            raw_segments.append({
-                "start": max(0.0, start + total_delay),
-                "end": max(0.0, end + total_delay),
-                "text": text
-            })
-
-        # Use the actual chunk duration to calculate the next offset.
-        try:
-            probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    str(chunk_path)
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            duration = (
-                float(probe.stdout.strip())
-                if probe.returncode == 0
-                else AUDIO_CHUNK_SECONDS
-            )
-
-        except (ValueError, subprocess.SubprocessError):
-            duration = AUDIO_CHUNK_SECONDS
-
-        offset += duration
-
-    raw_segments.sort(
-        key=lambda item: (item["start"], item["end"])
+    raise RuntimeError(
+        "Groq Whisper မှ အသံစာသားရယူမရပါ။ "
+        f"အသေးစိတ်: {str(last_error)[:500]}"
     )
 
-    cleaned = []
 
-    for segment in raw_segments:
-        if segment["end"] <= 0:
+def transcribe_video_audio(video_path, output_dir):
+    audio_path = extract_audio(
+        video_path,
+        output_dir,
+    )
+
+    chunks = split_audio(
+        audio_path,
+        output_dir,
+    )
+
+    items = []
+
+    for chunk_path, offset in chunks:
+        chunk_items = transcribe_audio_chunk(
+            chunk_path,
+            offset=offset,
+        )
+
+        items.extend(chunk_items)
+
+    return renumber_items(items)
+
+
+# =========================================================
+# OCR SUBTITLE DETECTION
+# =========================================================
+
+def ocr_frame_text(frame):
+    import numpy as np
+
+    engine = get_ocr_engine()
+
+    height, width = frame.shape[:2]
+
+    # Chinese subtitles usually appear in the lower part
+    # of a movie frame. Keep enough space for higher subtitles.
+    crop_y = int(height * 0.45)
+
+    cropped = frame[crop_y:height, 0:width]
+
+    if cropped.size == 0:
+        return ""
+
+    try:
+        result, _ = engine(cropped)
+    except Exception:
+        return ""
+
+    if not result:
+        return ""
+
+    detections = []
+
+    for detection in result:
+        try:
+            box = detection[0]
+            text = clean_text(detection[1])
+            score = float(detection[2])
+        except (IndexError, TypeError, ValueError):
             continue
 
-        segment["start"] = max(0.0, segment["start"])
-        segment["end"] = max(
-            segment["start"] + 0.15,
-            segment["end"]
-        )
+        if not text or score < 0.35:
+            continue
 
-        if cleaned and segment["start"] < cleaned[-1]["end"]:
-            cleaned[-1]["end"] = max(
-                cleaned[-1]["start"] + 0.15,
-                segment["start"]
-            )
-
-        cleaned.append(segment)
-
-    return [
-        segment for segment in cleaned
-        if segment["end"] > segment["start"]
-    ]
-
-
-
-@app.get("/")
-def home():
-    return render_template("index.html")
-
-
-@app.post("/api/process")
-def process_video():
-    if "video" not in request.files:
-        return jsonify(
-            error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"
-        ), 400
-
-    video = request.files["video"]
-
-    if not video.filename:
-        return jsonify(
-            error="ဗီဒီယိုဖိုင်ကို အရင်ရွေးပါ။"
-        ), 400
-
-    safe_name = secure_filename(video.filename)
-
-    if (
-        not safe_name
-        or Path(safe_name).suffix.lower() not in ALLOWED_EXTENSIONS
-    ):
-        return jsonify(
-            error="MP4, MOV, MKV သို့မဟုတ် WEBM ဖိုင်ကို ရွေးပါ။"
-        ), 400
-
-    try:
-        user_delay = float(
-            request.form.get("delay", "0.0")
-        )
-    except (TypeError, ValueError):
-        user_delay = 0.0
-
-    user_delay = max(-600.0, min(600.0, user_delay))
-
-    mode = str(
-        request.form.get("mode", "auto")
-    ).strip().lower()
-
-    if mode not in {"auto", "ocr", "audio"}:
-        mode = "auto"
-
-    gemini_key = os.getenv(
-        "GEMINI_API_KEY", ""
-    ).strip()
-
-    groq_key = os.getenv(
-        "GROQ_API_KEY", ""
-    ).strip()
-
-    if not gemini_key:
-        return jsonify(
-            error="GEMINI_API_KEY ကို .env ထဲတွင် ထည့်ပါ။"
-        ), 500
-
-    if mode == "audio" and not groq_key:
-        return jsonify(
-            error="Audio Mode အတွက် GROQ_API_KEY ကို .env ထဲတွင် ထည့်ပါ။"
-        ), 500
-
-    try:
-        from google import genai
-    except ImportError:
-        return jsonify(
-            error=(
-                "google-genai library မတပ်ဆင်ရသေးပါ။ "
-                "pip install google-genai"
-            )
-        ), 500
-
-    if mode == "audio":
         try:
-            from groq import Groq
-        except ImportError:
-            return jsonify(
-                error="groq library မတပ်ဆင်ရသေးပါ။ pip install groq"
-            ), 500
+            center_y = sum(
+                float(point[1])
+                for point in box
+            ) / len(box)
+        except Exception:
+            center_y = 0.0
 
-    job_dir = Path(
-        tempfile.mkdtemp(
-            prefix="movie_subtitle_",
-            dir=UPLOAD_DIR
+        detections.append(
+            (center_y, text)
+        )
+
+    detections.sort(
+        key=lambda item: item[0]
+    )
+
+    # Join text lines in reading order.
+    return clean_text(
+        " ".join(
+            text for _, text in detections
         )
     )
 
-    video_path = job_dir / safe_name
+
+def extract_ocr_subtitles(video_path):
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenCV မတပ်ဆင်ရသေးပါ။ "
+            "requirements.txt ထဲမှာ opencv-python-headless "
+            "ထည့်ပေးပါ။"
+        ) from exc
+
+    capture = cv2.VideoCapture(
+        str(video_path)
+    )
+
+    if not capture.isOpened():
+        capture.release()
+
+        raise RuntimeError(
+            "ဗီဒီယိုဖိုင်ကို ဖွင့်မရပါ။"
+        )
+
+    fps = capture.get(cv2.CAP_PROP_FPS)
+
+    if not fps or fps <= 0:
+        fps = 25.0
+
+    frame_count = capture.get(
+        cv2.CAP_PROP_FRAME_COUNT
+    )
+
+    duration = (
+        frame_count / fps
+        if frame_count and frame_count > 0
+        else None
+    )
+
+    interval = max(
+        0.2,
+        OCR_INTERVAL_SECONDS,
+    )
+
+    items = []
+
+    current_text = ""
+    current_start = 0.0
+    previous_time = 0.0
+
+    frame_number = 0
 
     try:
-        video.save(video_path)
+        while True:
+            timestamp = frame_number / fps
 
-        if (
-            not video_path.exists()
-            or video_path.stat().st_size == 0
-        ):
-            return jsonify(
-                error="ဗီဒီယိုဖိုင်ကို သိမ်းဆည်းမရပါ။"
-            ), 400
+            if (
+                duration is not None
+                and timestamp > duration
+            ):
+                break
 
-        gemini_client = genai.Client(
-            api_key=gemini_key
-        )
-
-        raw_segments = []
-        source_type = ""
-
-        # Decide whether OCR should be used.
-        use_ocr = mode == "ocr"
-
-        if mode == "auto":
-            try:
-                use_ocr = check_has_hardcoded_subs(
-                    video_path
-                )
-            except Exception:
-                app.logger.exception(
-                    "OCR subtitle detection failed"
-                )
-                use_ocr = False
-
-        # Read hardcoded subtitles from video frames.
-        if use_ocr:
-            try:
-                raw_segments = run_ocr_extraction(
-                    video_path
-                )
-
-                if raw_segments:
-                    source_type = (
-                        "OCR ဖြင့် ဗီဒီယိုပေါ်ရှိ စာတန်းကို "
-                        "ဖတ်ယူထားပါသည်။"
-                    )
-
-            except Exception:
-                app.logger.exception(
-                    "OCR extraction failed"
-                )
-                raw_segments = []
-
-        # Fall back to speech recognition if OCR finds no usable text.
-        if not raw_segments:
-            if not groq_key:
-                return jsonify(
-                    error=(
-                        "ဗီဒီယိုပေါ်ရှိ တရုတ်စာတန်းကို "
-                        "မဖတ်နိုင်ပါ။ အသံမှ စာသားထုတ်ယူရန် "
-                        "GROQ_API_KEY ကို .env ထဲတွင် ထည့်ပါ။"
-                    )
-                ), 422
-
-            try:
-                from groq import Groq
-            except ImportError:
-                return jsonify(
-                    error=(
-                        "groq library မတပ်ဆင်ရသေးပါ။ "
-                        "pip install groq"
-                    )
-                ), 500
-
-            groq_client = Groq(
-                api_key=groq_key
+            capture.set(
+                cv2.CAP_PROP_POS_MSEC,
+                timestamp * 1000,
             )
 
-            total_delay = (
-                SUBTITLE_DELAY_SECONDS + user_delay
-            )
+            success, frame = capture.read()
 
-            raw_segments = transcribe_audio(
-                video_path,
-                job_dir,
-                groq_client,
-                total_delay=total_delay
-            )
+            if not success:
+                break
 
-            source_type = (
-                "Whisper အသံမှတ်သားစနစ်ဖြင့် "
-                "စာသားထုတ်ယူထားပါသည်။"
-            )
+            text = ocr_frame_text(frame)
 
-        else:
-            # OCR timestamps also respect the user's sync adjustment.
-            total_delay = (
-                SUBTITLE_DELAY_SECONDS + user_delay
-            )
+            # Ignore empty frames but allow a brief OCR gap
+            # before deciding the current subtitle has ended.
+            if text:
+                normalized_text = re.sub(
+                    r"\s+",
+                    " ",
+                    text,
+                ).strip()
 
-            for segment in raw_segments:
-                original_start = float(
-                    segment["start"]
-                )
+                if not current_text:
+                    current_text = normalized_text
+                    current_start = timestamp
 
-                original_end = float(
-                    segment["end"]
-                )
+                elif normalized_text == current_text:
+                    pass
 
-                segment["start"] = max(
-                    0.0,
-                    original_start + total_delay
-                )
+                else:
+                    if timestamp > current_start:
+                        items.append(
+                            make_item(
+                                current_start,
+                                timestamp,
+                                current_text,
+                                source=current_text,
+                            )
+                        )
 
-                segment["end"] = max(
-                    segment["start"] + 0.15,
-                    original_end + total_delay
-                )
+                    current_text = normalized_text
+                    current_start = timestamp
 
-        if not raw_segments:
-            return jsonify(
-                error=(
-                    "ဖတ်ယူနိုင်သော တရုတ်စာတန်း သို့မဟုတ် "
-                    "စကားပြောစာသား မတွေ့ပါ။"
-                )
-            ), 422
+                previous_time = timestamp
 
-        raw_segments.sort(
-            key=lambda item: (
-                item["start"],
-                item["end"]
-            )
-        )
-
-        # Translate in batches to reduce API calls.
-        translated_lines = []
-
-        for start_index in range(
-            0,
-            len(raw_segments),
-            GEMINI_BATCH_SIZE
-        ):
-            batch = raw_segments[
-                start_index:
-                start_index + GEMINI_BATCH_SIZE
-            ]
-
-            try:
-                translated_lines.extend(
-                    translate_batch(
-                        gemini_client,
-                        batch
-                    )
-                )
-
-            except Exception as exc:
-                app.logger.exception(
-                    "Translation failed"
-                )
-
-                return jsonify(
-                    error=(
-                        "မြန်မာဘာသာပြန်ခြင်း မအောင်မြင်ပါ။ "
-                        "GEMINI_API_KEY၊ model၊ quota နဲ့ "
-                        "internet connection ကို စစ်ပါ။"
-                    ),
-                    detail=str(exc)[:500]
-                ), 502
-
-        items = []
-
-        for index, segment in enumerate(raw_segments):
-            if index < len(translated_lines):
-                translated = translated_lines[index]
             else:
-                translated = segment["text"]
+                # A blank OCR frame ends the subtitle at the
+                # current sample time.
+                if current_text:
+                    if timestamp - previous_time > interval * 1.5:
+                        items.append(
+                            make_item(
+                                current_start,
+                                max(
+                                    current_start + 0.15,
+                                    previous_time + interval,
+                                ),
+                                current_text,
+                                source=current_text,
+                            )
+                        )
 
-            items.append({
-                "index": index + 1,
-                "time": (
-                    f"{make_timestamp(segment['start'])} --> "
-                    f"{make_timestamp(segment['end'])}"
-                ),
-                "text": format_subtitle(
-                    translated
-                ),
-                "source": segment["text"]
-            })
+                        current_text = ""
 
-        return jsonify(
-            items=items,
-            notice=(
-                f"မြန်မာဘာသာပြန်ပြီးပါပြီ။ {source_type} "
-                "စာတန်းများကို ပြန်စစ်ပြီး SRT ထုတ်ပါ။"
+            frame_number = int(
+                round((timestamp + interval) * fps)
             )
-        )
-
-    except subprocess.TimeoutExpired:
-        app.logger.exception(
-            "Media processing timed out"
-        )
-
-        return jsonify(
-            error=(
-                "ဗီဒီယိုပြင်ဆင်ချိန် ကြာလွန်းသွားပါသည်။ "
-                "ဖိုင်တိုတစ်ခုဖြင့် ပြန်စမ်းပါ။"
-            )
-        ), 504
-
-    except ValueError as exc:
-        return jsonify(
-            error=str(exc)
-        ), 400
-
-    except Exception:
-        app.logger.error(
-            "Global processing error:\n%s",
-            traceback.format_exc()
-        )
-
-        return jsonify(
-            error=(
-                "စနစ်ချို့ယွင်းမှု ဖြစ်ပေါ်သွားပါသည်။ "
-                "Server console log ကို စစ်ဆေးပါ။"
-            )
-        ), 500
 
     finally:
-        shutil.rmtree(
-            job_dir,
-            ignore_errors=True
+        capture.release()
+
+    if current_text:
+        end_time = (
+            duration
+            if duration is not None
+            else previous_time + interval
         )
 
+        items.append(
+            make_item(
+                current_start,
+                max(
+                    current_start + 0.15,
+                    end_time,
+                ),
+                current_text,
+                source=current_text,
+            )
+        )
 
-@app.post("/api/export")
-def export_srt():
-    payload = request.get_json(
-        silent=True
-    ) or {}
+    return renumber_items(items)
 
-    items = payload.get(
-        "items", []
+
+# =========================================================
+# GEMINI TRANSLATION
+# =========================================================
+
+def parse_json_array(response_text):
+    text = clean_text(response_text)
+
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
 
-    if not isinstance(items, list):
-        return jsonify(
-            error="SRT export အတွက် items ပုံစံ မမှန်ပါ။"
-        ), 400
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
+
+    try:
+        data = json.loads(text)
+
+        if isinstance(data, list):
+            return data
+
+        if isinstance(data, dict):
+            if isinstance(data.get("translations"), list):
+                return data["translations"]
+
+            if isinstance(data.get("items"), list):
+                return data["items"]
+
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt to recover a JSON array from surrounding text.
+    match = re.search(
+        r"\[[\s\S]*\]",
+        text,
+    )
+
+    if match:
+        try:
+            data = json.loads(match.group(0))
+
+            if isinstance(data, list):
+                return data
+
+        except json.JSONDecodeError:
+            pass
+
+    raise RuntimeError(
+        "Gemini မှ မှန်ကန်သော JSON ဘာသာပြန်ရလဒ် မရရှိပါ။"
+    )
+
+
+def translate_batch(texts):
+    if not texts:
+        return []
+
+    client = get_gemini_client()
+
+    payload = [
+        {
+            "id": index,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    prompt = """
+You are a professional Chinese-to-Myanmar subtitle translator.
+
+Translate each Chinese subtitle into natural, conversational
+Myanmar Burmese suitable for movie recap and dialogue subtitles.
+
+Rules:
+1. Keep every input id exactly unchanged.
+2. Return exactly one translation for every input item.
+3. Do not omit any items.
+4. Preserve the original meaning, emotion, names, and context.
+5. Use natural spoken Burmese, not stiff word-for-word Burmese.
+6. Do not add explanations, notes, or quotation marks.
+7. Do not return the original Chinese as the translation.
+8. Keep each translation concise enough for subtitles.
+9. Return valid JSON only, using this schema:
+[
+  {"id": 0, "text": "မြန်မာဘာသာပြန်"},
+  {"id": 1, "text": "မြန်မာဘာသာပြန်"}
+]
+
+Input:
+""" + json.dumps(
+        payload,
+        ensure_ascii=False,
+    )
+
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+
+            response_text = getattr(
+                response,
+                "text",
+                None,
+            )
+
+            if not response_text:
+                raise RuntimeError(
+                    "Gemini က စာသားရလဒ် မပြန်ပေးပါ။"
+                )
+
+            parsed = parse_json_array(
+                response_text
+            )
+
+            translations = {
+                int(item["id"]): clean_text(item["text"])
+                for item in parsed
+                if isinstance(item, dict)
+                and "id" in item
+                and "text" in item
+            }
+
+            output = []
+
+            for index in range(len(texts)):
+                translation = translations.get(
+                    index,
+                    "",
+                )
+
+                if not translation:
+                    raise RuntimeError(
+                        f"စာတန်း {index + 1} အတွက် "
+                        "ဘာသာပြန်ချက် မရရှိပါ။"
+                    )
+
+                output.append(translation)
+
+            return output
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt + 1 < MAX_RETRIES:
+                time.sleep(1.5 * (attempt + 1))
+
+    raise RuntimeError(
+        "Gemini ဘာသာပြန်မှု မအောင်မြင်ပါ။ "
+        f"အသေးစိတ်: {str(last_error)[:500]}"
+    )
+
+
+def translate_items(items):
+    if not items:
+        return []
 
     output = []
 
-    for item in items:
-        if not isinstance(item, dict):
-            continue
+    # Translation cache avoids repeated requests for identical
+    # source text within the current processing run.
+    cache = {}
 
-        timestamp = str(
-            item.get("time", "")
-        ).strip()
+    batch_size = max(
+        1,
+        TRANSLATION_BATCH_SIZE,
+    )
 
-        text = str(
-            item.get("text", "")
-        ).strip()
+    for offset in range(0, len(items), batch_size):
+        batch = items[
+            offset:offset + batch_size
+        ]
 
-        if "-->" in timestamp and text:
-            output.append(
-                f"{len(output) + 1}\n{timestamp}\n{text}"
+        texts_to_translate = []
+        original_positions = []
+
+        for position, item in enumerate(batch):
+            source = clean_text(
+                item.get("source")
+                or item.get("text")
             )
 
-    if not output:
-        return jsonify(
-            error="ထုတ်ယူရန် စာတန်းမရှိပါ။"
-        ), 400
+            if not source:
+                continue
 
-    data = (
-        "\n\n".join(output) + "\n"
-    ).encode("utf-8-sig")
+            if source in cache:
+                continue
 
-    return send_file(
-        BytesIO(data),
-        mimetype="application/x-subrip",
-        as_attachment=True,
-        download_name="myanmar_subtitles.srt"
+            original_positions.append(
+                (position, source)
+            )
+
+            texts_to_translate.append(source)
+
+        if texts_to_translate:
+            translated = translate_batch(
+                texts_to_translate
+            )
+
+            for source, translation in zip(
+                texts_to_translate,
+                translated,
+            ):
+                cache[source] = translation
+
+        for item in batch:
+            source = clean_text(
+                item.get("source")
+                or item.get("text")
+            )
+
+            if not source:
+                continue
+
+            translation = cache.get(
+                source,
+                "",
+            )
+
+            if not translation:
+                raise RuntimeError(
+                    "ဘာသာပြန်စာသား မရရှိပါ။ "
+                    "တရုတ်စာသားကို မူရင်းအတိုင်း "
+                    "မြန်မာစာတန်းအဖြစ် မထည့်ထားပါ။"
+                )
+
+            output.append(
+                make_item(
+                    start=item["start"],
+                    end=item["end"],
+                    text=translation,
+                    source=source,
+                )
+            )
+
+    return renumber_items(output)
+
+
+# =========================================================
+# SRT EXPORT
+# =========================================================
+
+def build_srt(items):
+    normalized = renumber_items(items)
+
+    blocks = []
+
+    for index, item in enumerate(
+        normalized,
+        start=1,
+    ):
+        blocks.append(
+            f"{index}\n"
+            f"{make_timestamp(item['start'])} --> "
+            f"{make_timestamp(item['end'])}\n"
+            f"{item['text']}"
+        )
+
+    return (
+        "\n\n".join(blocks) + "\n"
+        if blocks
+        else ""
     )
 
 
-@app.errorhandler(413)
-def file_too_large(_error):
-    return jsonify(
-        error=(
-            "ဖိုင်အရွယ်အစား ကြီးလွန်းပါသည်။ "
-            "MAX_UPLOAD_MB ကို စစ်ဆေးပါ။"
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
+@app.route("/", methods=["GET"])
+def index():
+    # Flask serves templates/index.html automatically.
+    from flask import render_template
+
+    return render_template("index.html")
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "Movie Subtitle AI",
+    })
+
+
+# =========================================================
+# PROCESS VIDEO API
+# =========================================================
+
+@app.route("/api/process", methods=["POST"])
+def process_video():
+    upload = request.files.get("video")
+
+    if upload is None:
+        return jsonify({
+            "error": "ဗီဒီယိုဖိုင် မရရှိပါ။"
+        }), 400
+
+    if not upload.filename:
+        return jsonify({
+            "error": "ဗီဒီယိုဖိုင်ကို ရွေးပေးပါ။"
+        }), 400
+
+    if not allowed_file(upload.filename):
+        return jsonify({
+            "error": (
+                "မထောက်ပံ့သော ဖိုင်အမျိုးအစားဖြစ်ပါသည်။ "
+                "MP4, MOV, MKV, WEBM သို့မဟုတ် AVI ကို သုံးပါ။"
+            )
+        }), 400
+
+    mode = clean_text(
+        request.form.get("mode", "auto")
+    ).lower()
+
+    if mode not in {"auto", "audio", "ocr"}:
+        mode = "auto"
+
+    safe_name = secure_filename(
+        upload.filename
+    ) or "uploaded_video.mp4"
+
+    extension = Path(safe_name).suffix.lower()
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="movie_subtitle_"
+        ) as temp_dir:
+
+            video_path = os.path.join(
+                temp_dir,
+                "input" + extension,
+            )
+
+            upload.save(video_path)
+
+            if (
+                not os.path.exists(video_path)
+                or os.path.getsize(video_path) == 0
+            ):
+                return jsonify({
+                    "error": "ဗီဒီယိုဖိုင် အလွတ်ဖြစ်နေပါသည်။"
+                }), 400
+
+            if mode == "audio":
+                source_items = transcribe_video_audio(
+                    video_path,
+                    temp_dir,
+                )
+
+            elif mode == "ocr":
+                source_items = extract_ocr_subtitles(
+                    video_path
+                )
+
+            else:
+                # Auto: try OCR first. If no subtitle text
+                # is detected, use audio transcription.
+                source_items = extract_ocr_subtitles(
+                    video_path
+                )
+
+                if not source_items:
+                    source_items = transcribe_video_audio(
+                        video_path,
+                        temp_dir,
+                    )
+
+            source_items = renumber_items(
+                source_items
+            )
+
+            if not source_items:
+                return jsonify({
+                    "error": (
+                        "စာတန်းထိုး သို့မဟုတ် စကားပြောအသံ "
+                        "မတွေ့ပါ။ Audio mode နဲ့ ထပ်စမ်းကြည့်ပါ။"
+                    )
+                }), 422
+
+            translated_items = translate_items(
+                source_items
+            )
+
+            if not translated_items:
+                return jsonify({
+                    "error": "ဘာသာပြန်ရလဒ် မရရှိပါ။"
+                }), 422
+
+            return jsonify({
+                "success": True,
+                "count": len(translated_items),
+                "items": translated_items,
+            })
+
+    except subprocess.TimeoutExpired:
+        app.logger.exception(
+            "FFmpeg operation timed out"
         )
-    ), 413
+
+        return jsonify({
+            "error": (
+                "ဗီဒီယိုလုပ်ဆောင်ချိန် ကျော်လွန်သွားပါသည်။ "
+                "ဖိုင်တိုတစ်ခုနဲ့ ထပ်စမ်းကြည့်ပါ။"
+            )
+        }), 504
+
+    except Exception as exc:
+        app.logger.exception(
+            "Video processing failed"
+        )
+
+        return jsonify({
+            "error": str(exc)[:1500]
+        }), 500
+
+
+# =========================================================
+# EXPORT API
+# =========================================================
+
+@app.route("/api/export", methods=["POST"])
+def export_srt():
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    items = data.get("items", [])
+
+    if not isinstance(items, list):
+        return jsonify({
+            "error": "items သည် list ဖြစ်ရပါမည်။"
+        }), 400
+
+    srt_content = build_srt(items)
+
+    if not srt_content.strip():
+        return jsonify({
+            "error": (
+                "SRT ထုတ်ရန် မှန်ကန်သော စာတန်းနှင့် "
+                "အချိန်တံဆိပ် မရှိပါ။"
+            )
+        }), 400
+
+    return Response(
+        "\ufeff" + srt_content,
+        mimetype="application/x-subrip; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                'attachment; filename="myanmar_subtitles.srt"'
+        },
+    )
+
+
+# =========================================================
+# ERROR HANDLERS
+# =========================================================
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({
+        "error": (
+            "ဗီဒီယိုဖိုင် အရွယ်အစား အလွန်ကြီးနေပါသည်။ "
+            f"အများဆုံး {app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)} MB "
+            "အထိသာ တင်နိုင်ပါသည်။"
+        )
+    }), 413
+
+
+@app.errorhandler(404)
+def not_found(error):
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "error": "API endpoint မတွေ့ပါ။"
+        }), 404
+
+    return "Page not found", 404
 
 
 @app.errorhandler(500)
-def server_error(_error):
-    return jsonify(
-        error=(
-            "Internal Server Error: "
-            "Backend တွင် ပြဿနာရှိနေပါသည်။"
-        )
-    ), 500
-
-
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(
-            os.getenv("PORT", "5000")
-        ),
-        debug=False
+def internal_server_error(error):
+    app.logger.exception(
+        "Unhandled server error"
     )
 
+    return jsonify({
+        "error": (
+            "Server ဘက်မှာ ပြဿနာဖြစ်နေပါသည်။ "
+            "Render Logs ကို စစ်ဆေးပါ။"
+        )
+    }), 500
+
+
+# =========================================================
+# START SERVER
+# =========================================================
+
+if __name__ == "__main__":
+    port = int(
+        os.getenv("PORT", "5000")
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+    )
