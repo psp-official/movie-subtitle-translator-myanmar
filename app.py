@@ -12,6 +12,7 @@ from collections import OrderedDict
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
+from google import genai
 
 from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
