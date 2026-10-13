@@ -21,8 +21,8 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "movie_subtitle_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-# အကောင်းဆုံးနှင့် မြန်မာစာအမှန်ကန်ဆုံး Free မော်ဒယ်ကိုသာ Default ထားပါသည်
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct:free")
+# OpenRouter တွင် လက်ရှိ အခမဲ့ရနေသော မော်ဒယ်ကို Default ထားပါသည်
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-3b-instruct:free")
 API_BATCH_SIZE = max(1, min(40, int(os.getenv("API_BATCH_SIZE", "15"))))
 API_RETRIES = max(0, min(5, int(os.getenv("API_RETRIES", "3"))))
 SUBTITLE_DELAY_SECONDS = float(os.getenv("SUBTITLE_DELAY_SECONDS", "0.0"))
@@ -88,12 +88,12 @@ def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
     if uncached:
         response = None
         
-        # စွမ်းဆောင်ရည်အမြင့်ဆုံး 70B+ အဆင့်ရှိသော မြန်မာစာအထောက်အပံ့ကောင်းသည့် Free Models များကိုသာ သုံးပါမည်
+        # OpenRouter တွင် လက်ရှိ အခမဲ့ရနေသော မော်ဒယ်များစာရင်း
         fallback_models = [
-            "qwen/qwen-2.5-72b-instruct:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "google/gemini-2.0-pro-exp-0205:free",
-            "nvidia/llama-3.1-nemotron-70b-instruct:free"
+            "meta-llama/llama-3.2-3b-instruct:free",
+            "google/gemma-2-9b-it:free",
+            "microsoft/phi-3-mini-128k-instruct:free",
+            "openchat/openchat-7b:free"
         ]
 
         success = False
@@ -114,7 +114,7 @@ def translate_batch(client, segments, model_name=OPENROUTER_MODEL):
                 except Exception as exc:
                     err_msg = str(exc)
                     app.logger.warning(f"Error with model {current_model} (Attempt {attempt+1}/{API_RETRIES}): {err_msg}")
-                    if "404" in err_msg or "unavailable" in err_msg.lower() or "no endpoints found" in err_msg.lower() or "not a valid model" in err_msg.lower() or "403" in err_msg:
+                    if "404" in err_msg or "unavailable" in err_msg.lower() or "no endpoints found" in err_msg.lower() or "not a valid model" in err_msg.lower() or "403" in err_msg or "400" in err_msg:
                         break 
                     time.sleep(min(30, 2 ** attempt * 2))
 
@@ -165,14 +165,12 @@ def check_has_hardcoded_subs(video_path):
             
             if frame_count % frame_interval == 0:
                 h, w, _ = frame.shape
-                # ပြင်ဆင်ချက်: ဗီဒီယို၏ အောက်ခြေ ၂၅% ကိုသာ ဖတ်ပါမည် (ဆိုင်းဘုတ်များ ဖတ်မိခြင်းမှ ကာကွယ်ရန်)
                 crop = frame[int(h*0.75):h, :]
                 
                 result, _ = ocr(crop)
                 
                 if result:
                     text = "".join([line[1] for line in result if line[2] > 0.6])
-                    # တရုတ်စာလုံး အနည်းဆုံး ၂ လုံးပါမှ စာတန်းအဖြစ် သတ်မှတ်မည်
                     if len(re.findall(r'[\u4e00-\u9fff]', text)) >= 2:
                         chinese_frames += 1
                         if chinese_frames >= 3:
@@ -209,7 +207,6 @@ def run_ocr_extraction(video_path):
         
         if frame_count % frame_interval == 0:
             h, w, _ = frame.shape
-            # ပြင်ဆင်ချက်: ဗီဒီယို၏ အောက်ခြေ ၂၅% ကိုသာ ဖတ်ပါမည်
             crop = frame[int(h*0.75):h, :]
             
             result, _ = ocr(crop)
@@ -296,7 +293,6 @@ def process_video():
             
             groq_client = Groq(api_key=groq_key)
             with open(audio_path, "rb") as audio_file:
-                # ပြင်ဆင်ချက်: Whisper သို့ တရုတ်စကားပြောဖြစ်ကြောင်း သေချာစေရန် Prompt ထည့်သွင်းထားပါသည်
                 transcription = groq_client.audio.transcriptions.create(
                     file=(audio_path.name, audio_file.read()), 
                     model="whisper-large-v3", 
